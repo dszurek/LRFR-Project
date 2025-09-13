@@ -1,0 +1,34 @@
+\documentclass{IEEEtran}
+\usepackage[utf8]{inputenc}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
+\usepackage{enumitem}
+
+\title{A Unique Pipeline for Low Resolution Facial Recognition}
+\author{Daniel Szurek, Brandon Nguyen}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+
+
+\begin{abstract}
+This paper proposes a unique pipeline for low-resolution facial recognition (LRFR) using deep learning techniques. The pipeline consists of a super-resolution model proposed by Wilman et al, and the FN8 facial recognition model proposed by Deng et al. The super-resolution model enhances low-resolution images, while the FN8 model extracts features for recognition. We evaluate the performance of our pipeline on various datasets and live performance on an edge device and compare it with existing LRFR methods. Our results demonstrate that the proposed pipeline achieves state-of-the-art performance in LRFR tasks, highlighting its effectiveness and potential for real-world applications.
+\end{abstract}
+
+\begin{IEEEkeywords}
+low-resolution face recognition, deep learning
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+\renewcommand\thesubsection{\thesection.\Alph{subsection}}
+
+\subsection{Background and Motivation}
+Security systems often rely on facial recognition technology to identify individuals. However, in many real-world scenarios, the images captured are of low resolution due to factors such as distance from the camera, poor lighting conditions, or limitations of the camera itself. This poses a significant challenge for accurate facial recognition, as traditional models struggle to extract meaningful features from low-resolution images. To address this issue, we propose a unique pipeline that combines super-resolution techniques with advanced, lightweight facial recognition models to enhance the quality of low-resolution images and improve recognition accuracy.
+
+
+
+\end{document}
