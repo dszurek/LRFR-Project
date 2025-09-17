@@ -1,6 +1,6 @@
 # Fdb version 4
-["pdflatex"] 1757723857.55462 "/Users/dszurek/Library/CloudStorage/OneDrive-TheUniversityofAlabama/School/Classwork/CS 565/project/Submission Paper/paper.tex" "paper.pdf" "paper" 1757723858.85184 0
-  "/Users/dszurek/Library/CloudStorage/OneDrive-TheUniversityofAlabama/School/Classwork/CS 565/project/Submission Paper/paper.tex" 1757723855.84585 1890 31535de06e3b5cdf302a646955199f1b ""
+["pdflatex"] 1757957227.34614 "/Users/dszurek/Library/CloudStorage/OneDrive-TheUniversityofAlabama/School/Classwork/CS 565/project/Submission Paper/paper.tex" "paper.pdf" "paper" 1757957228.69952 0
+  "/Users/dszurek/Library/CloudStorage/OneDrive-TheUniversityofAlabama/School/Classwork/CS 565/project/Submission Paper/paper.tex" 1757957226.84449 2699 19741455787f11d15d1fa6415486a39e ""
   "/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/base/8r.enc" 1165713224 4850 80dc9bab7f31fb78a000ccfed0e27cab ""
   "/usr/local/texlive/2025/texmf-dist/fonts/map/fontname/texfonts.map" 1577235249 3524 cb3e574dea2d1052e39280babc910dc8 ""
   "/usr/local/texlive/2025/texmf-dist/fonts/tfm/adobe/times/ptmb7t.tfm" 1136768653 2172 fd0c924230362ff848a33632ed45dc23 ""
@@ -105,8 +105,8 @@
   "/usr/local/texlive/2025/texmf-var/fonts/map/pdftex/updmap/pdftex.map" 1756143609 5467155 19efa205003f9ecad95fbbaa6ff24da1 ""
   "/usr/local/texlive/2025/texmf-var/web2c/pdftex/pdflatex.fmt" 1741450574 3345740 46b66fdb0378f7bf5921b5eabf1762b8 ""
   "/usr/local/texlive/2025/texmf.cnf" 1741450484 577 418a7058ec8e006d8704f60ecd22c938 ""
-  "paper.aux" 1757723858.73325 250 f79debc0b2bc5fe8505ca1ace7ae8085 "pdflatex"
-  "paper.tex" 1757723855.84585 1890 31535de06e3b5cdf302a646955199f1b ""
+  "paper.aux" 1757957228.5909 2001 f083048c9caeb1454fb7cf37581d32f9 "pdflatex"
+  "paper.tex" 1757957226.84449 2699 19741455787f11d15d1fa6415486a39e ""
   (generated)
   "paper.aux"
   "paper.log"
