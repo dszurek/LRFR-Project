@@ -1,89 +1,99 @@
-# Save this code as preprocess_data.py
+# Save this file as technical/dataset/preprocess.py
 
-import cv2
 import os
 import glob
-from mtcnn import MTCNN
+import cv2
+import numpy as np
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
+import shutil
 
 # --- Configuration ---
-RAW_IMAGE_DIR = "raw_dataset"
-OUTPUT_DIR = "processed_dataset"
+SOURCE_HR_DIR = "train/HR"
+SOURCE_LR_DIR = "train/LR"
+TRAIN_DIR = "train_processed"
+VAL_DIR = "val_processed"
+TEST_DIR = "test_processed"
 HR_IMG_SIZE = (160, 160)
 VLR_IMG_SIZE = (14, 16)
-DOWNSAMPLE_INTERPOLATION = cv2.INTER_CUBIC
+TEST_SPLIT_RATIO = 0.10
+VAL_SPLIT_RATIO = 0.10
 # --- End of Configuration ---
 
 
-def create_directories():
-    """Creates the necessary output directories if they don't exist."""
-    global hr_dir, vlr_dir
-    hr_dir = os.path.join(OUTPUT_DIR, "hr_images")
-    vlr_dir = os.path.join(OUTPUT_DIR, "vlr_images")
-    os.makedirs(hr_dir, exist_ok=True)
-    os.makedirs(vlr_dir, exist_ok=True)
-    print(f"✅ Output directories created at: {os.path.abspath(OUTPUT_DIR)}")
+def process_and_copy(file_list, source_dir, dest_dir, target_size, desc="Processing"):
+    """Processes a list of image files and copies them to the destination with a progress bar."""
+    os.makedirs(dest_dir, exist_ok=True)
+    # *** MODIFICATION HERE: tqdm is now wrapped around the file list iterator ***
+    for filename in tqdm(file_list, desc=desc):
+        src_path = os.path.join(source_dir, filename)
+        dest_path = os.path.join(dest_dir, filename)
+
+        img = cv2.imread(src_path)
+        if img is None:
+            continue
+
+        img_resized = cv2.resize(img, target_size, interpolation=cv2.INTER_AREA)
+        cv2.imwrite(dest_path, img_resized)
 
 
-def process_images(detector):
-    """Finds all images, detects faces, and creates HR/VLR pairs."""
-    image_paths = glob.glob(os.path.join(RAW_IMAGE_DIR, "**", "*.*"), recursive=True)
-    image_paths = [
-        path
-        for path in image_paths
-        if path.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".ppm"))
-    ]
+def main():
+    """Main function to orchestrate the dataset splitting and processing."""
+    print("Starting dataset preprocessing for COLOR images...")
 
-    if not image_paths:
-        print(f"❌ Error: No images found in '{RAW_IMAGE_DIR}'. Please check the path.")
-        return
+    all_hr_files = os.listdir(SOURCE_HR_DIR)
+    subjects = sorted(list(set([f.split("_")[0] for f in all_hr_files])))
+    print(f"Found {len(subjects)} unique subjects.")
 
-    print(f"Found {len(image_paths)} images to process. Starting...")
+    train_val_subjects, test_subjects = train_test_split(
+        subjects, test_size=TEST_SPLIT_RATIO, random_state=42
+    )
+    val_split_adjusted = VAL_SPLIT_RATIO / (1 - TEST_SPLIT_RATIO)
+    train_subjects, val_subjects = train_test_split(
+        train_val_subjects, test_size=val_split_adjusted, random_state=42
+    )
 
-    skipped_count = 0
-    for img_path in tqdm(image_paths, desc="Processing Images"):
-        try:
-            img = cv2.imread(img_path)
-            if img is None:
-                skipped_count += 1
-                continue
+    print(
+        f"Splitting subjects: {len(train_subjects)} train, {len(val_subjects)} validation, {len(test_subjects)} test."
+    )
 
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            results = detector.detect_faces(img_rgb)
+    subject_map = {s: "train" for s in train_subjects}
+    subject_map.update({s: "val" for s in val_subjects})
+    subject_map.update({s: "test" for s in test_subjects})
 
-            if not results:
-                skipped_count += 1
-                continue
+    file_sets = {"train": [], "val": [], "test": []}
+    for filename in all_hr_files:
+        subject_id = filename.split("_")[0]
+        if subject_id in subject_map:
+            set_name = subject_map[subject_id]
+            file_sets[set_name].append(filename)
 
-            x1, y1, width, height = results[0]["box"]
-            x1, y1 = abs(x1), abs(y1)
-            x2, y2 = x1 + width, y1 + height
-            face = img[y1:y2, x1:x2]
+    print("Processing and copying files...")
+    for set_name in ["train", "val", "test"]:
+        file_list = file_sets[set_name]
+        output_base = globals()[f"{set_name.upper()}_DIR"]
 
-            hr_face = cv2.resize(face, HR_IMG_SIZE, interpolation=cv2.INTER_AREA)
-            hr_face_gray = cv2.cvtColor(hr_face, cv2.COLOR_BGR2GRAY)
-            vlr_face_gray = cv2.resize(
-                hr_face_gray, VLR_IMG_SIZE, interpolation=DOWNSAMPLE_INTERPOLATION
-            )
+        # Call the function which now contains its own progress bar
+        process_and_copy(
+            file_list,
+            SOURCE_HR_DIR,
+            os.path.join(output_base, "hr_images"),
+            HR_IMG_SIZE,
+            desc=f"Processing {set_name} HR",
+        )
+        process_and_copy(
+            file_list,
+            SOURCE_LR_DIR,
+            os.path.join(output_base, "vlr_images"),
+            VLR_IMG_SIZE,
+            desc=f"Processing {set_name} LR",
+        )
 
-            base_filename = os.path.splitext(os.path.basename(img_path))[0]
-            parent_dir_name = os.path.basename(os.path.dirname(img_path))
-            save_filename = f"{parent_dir_name}_{base_filename}.png"
-
-            cv2.imwrite(os.path.join(hr_dir, save_filename), hr_face_gray)
-            cv2.imwrite(os.path.join(vlr_dir, save_filename), vlr_face_gray)
-
-        except Exception as e:
-            print(f"Error processing {img_path}: {e}")
-            skipped_count += 1
-
-    print("\n--- Processing Complete! ---")
-    print(f"✅ Successfully processed {len(image_paths) - skipped_count} images.")
-    print(f"⚠️ Skipped {skipped_count} images (no face detected or error).")
+    print("\n--- Preprocessing Complete! ---")
+    print(
+        f"Color data has been split and processed into '{TRAIN_DIR}', '{VAL_DIR}', and '{TEST_DIR}' folders."
+    )
 
 
 if __name__ == "__main__":
-    print("Initializing MTCNN face detector...")
-    detector = MTCNN(min_face_size=20)
-    create_directories()
-    process_images(detector)
+    main()
