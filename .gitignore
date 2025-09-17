@@ -1,1 +1,3 @@
-/technical/dataset/train/*
+/technical/dataset/test_processed/*
+/technical/dataset/train_processed/*
+/technical/dataset/val_processed/*
