@@ -1,195 +1,254 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-from torchvision import models
+# technical/dsr/train_dsr.py
 import os
 import glob
 import cv2
-from tqdm import tqdm
+import random
 import numpy as np
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+
+# Correctly import the EdgeFace model-building functions
+
+from facial_rec.backbones import get_model, replace_linear_with_lowrank_2
+
+# ============================================================
+# Config
+# ============================================================
+# Paths are relative to the 'technical/' directory where the script is run from
+TRAIN_DIR = "dataset/train_processed"
+VAL_DIR = "dataset/val_processed"
+EDGEFACE_WEIGHTS_PATH = "facial_rec/edgeface_weights/edgeface_s_gamma_05.pt"
+SAVE_PATH = "dsr.pth"
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+EPOCHS = 60
+BATCH_SIZE = 12
+LR = 1e-4
+LAMBDA_ID = 0.1  # Weight for identity-preserving loss
+NUM_WORKERS = 8 if torch.cuda.is_available() else 0
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+EDGEFACE_INPUT_SIZE = 112
 
 
-# ==============================================================================
-#  Component 1: The DSR Network Architecture
-# ==============================================================================
-class DSRModel(nn.Module):
-    def __init__(self, upscale_factor=10):
-        super(DSRModel, self).__init__()
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.upsample_block = nn.Sequential(
-            nn.Conv2d(128, 128 * (upscale_factor**2), kernel_size=3, padding=1),
-            nn.PixelShuffle(upscale_factor),
-            nn.PReLU(),
-        )
-        self.conv_out = nn.Conv2d(128, 3, kernel_size=3, padding=1)
-
-    def forward(self, x):
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        x = self.upsample_block(x)
-        output = self.conv_out(x)
-        return output
-
-
-# ==============================================================================
-#  Component 2: The Custom DSR Loss Function
-# ==============================================================================
-class DSRLoss(nn.Module):
-    def __init__(self, gamma=0.01, margin=1.0):
-        super(DSRLoss, self).__init__()
-        self.gamma = gamma
-        self.recon_loss = nn.L1Loss()
-        self.triplet_loss = nn.TripletMarginLoss(margin=margin)
-
-        vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features[:9]
-        vgg.eval()
-        for param in vgg.parameters():
-            param.requires_grad = False
-        self.feature_extractor = vgg
-
-    def get_triplets(self, embeddings, labels):
-        # Note: This is a simplified triplet creation method for demonstration.
-        # For a full research paper, a more advanced triplet mining strategy is recommended.
-        anchors, positives, negatives = [], [], []
-        unique_labels = torch.unique(labels)
-        for label in unique_labels:
-            is_pos = labels == label
-            is_neg = labels != label
-            pos_indices = torch.where(is_pos)[0]
-            neg_indices = torch.where(is_neg)[0]
-
-            if len(pos_indices) > 1 and len(neg_indices) > 0:
-                anchor_idx = pos_indices[0]
-                positive_idx = pos_indices[1]
-                negative_idx = neg_indices[0]
-                anchors.append(embeddings[anchor_idx])
-                positives.append(embeddings[positive_idx])
-                negatives.append(embeddings[negative_idx])
-
-        if not anchors:
-            return None, None, None
-        return torch.stack(anchors), torch.stack(positives), torch.stack(negatives)
-
-    def forward(self, predicted_hr, true_hr, labels):
-        l_recon = self.recon_loss(predicted_hr, true_hr)
-
-        predicted_embeddings = self.feature_extractor(predicted_hr)
-        predicted_embeddings = predicted_embeddings.view(
-            predicted_embeddings.size(0), -1
-        )
-
-        anchors, positives, negatives = self.get_triplets(predicted_embeddings, labels)
-
-        l_disc = torch.tensor(0.0, device=predicted_hr.device)
-        if anchors is not None:
-            l_disc = self.triplet_loss(anchors, positives, negatives)
-
-        total_loss = l_recon + self.gamma * l_disc
-        return total_loss
-
-
-# ==============================================================================
-#  Component 3: The Dataset Loader
-# ==============================================================================
-class FaceSuperResDataset(Dataset):
+# ============================================================
+# Dataset
+# ============================================================
+class PairedFaceSRDataset(Dataset):
     def __init__(self, data_dir):
-        self.hr_image_paths = sorted(
-            glob.glob(os.path.join(data_dir, "hr_images", "*.png"))
-        )
-        self.vlr_image_paths = sorted(
+        self.vlr_paths = sorted(
             glob.glob(os.path.join(data_dir, "vlr_images", "*.png"))
         )
-        # Extract labels from filenames (e.g., '001_...' -> label 0)
-        self.labels = [
-            int(os.path.basename(p).split("_")[0]) - 1 for p in self.hr_image_paths
-        ]
+        self.hr_paths = sorted(glob.glob(os.path.join(data_dir, "hr_images", "*.png")))
+        assert len(self.vlr_paths) == len(self.hr_paths)
+        self.transform = transforms.ToTensor()
 
     def __len__(self):
-        return len(self.hr_image_paths)
+        return len(self.vlr_paths)
 
     def __getitem__(self, idx):
-        hr_path = self.hr_image_paths[idx]
-        vlr_path = self.vlr_image_paths[idx]
-        label = self.labels[idx]
+        vlr_bgr = cv2.imread(self.vlr_paths[idx], cv2.IMREAD_COLOR)
+        hr_bgr = cv2.imread(self.hr_paths[idx], cv2.IMREAD_COLOR)
+        vlr_rgb = cv2.cvtColor(vlr_bgr, cv2.COLOR_BGR2RGB)
+        hr_rgb = cv2.cvtColor(hr_bgr, cv2.COLOR_BGR2RGB)
+        return self.transform(vlr_rgb), self.transform(hr_rgb)
 
-        # Load images with OpenCV (reads as BGR)
-        hr_image = cv2.imread(hr_path)
-        vlr_image = cv2.imread(vlr_path)
 
-        # Convert BGR to RGB
-        hr_image = cv2.cvtColor(hr_image, cv2.COLOR_BGR2RGB)
-        vlr_image = cv2.cvtColor(vlr_image, cv2.COLOR_BGR2RGB)
+# ============================================================
+# Utilities
+# ============================================================
+def compute_psnr(sr, hr, max_val=1.0):
+    mse = torch.mean((sr - hr) ** 2, dim=[1, 2, 3])
+    psnr_vals = 10 * torch.log10((max_val**2) / (mse + 1e-12))
+    return psnr_vals.mean().item()
 
-        # Normalize to [0, 1] and convert to PyTorch tensor format (C, H, W)
-        hr_tensor = (
-            torch.from_numpy(hr_image.astype(np.float32)).permute(2, 0, 1) / 255.0
+
+# ============================================================
+# DSR Model
+# ============================================================
+class ResidualBlock(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        self.conv1 = nn.Conv2d(ch, ch, 3, 1, 1)
+        self.prelu = nn.PReLU()
+        self.conv2 = nn.Conv2d(ch, ch, 3, 1, 1)
+
+    def forward(self, x):
+        r = self.conv1(x)
+        r = self.prelu(r)
+        r = self.conv2(r)
+        return self.prelu(x + r)
+
+
+class DSRColor(nn.Module):
+    def __init__(self, in_ch=3, base_ch=64, res_blocks=8, up_factors=[2, 5]):
+        super().__init__()
+        self.conv_in = nn.Conv2d(in_ch, base_ch, 3, 1, 1)
+        self.res_blocks = nn.Sequential(
+            *[ResidualBlock(base_ch) for _ in range(res_blocks)]
         )
-        vlr_tensor = (
-            torch.from_numpy(vlr_image.astype(np.float32)).permute(2, 0, 1) / 255.0
+        self.ups = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(base_ch, base_ch * (f**2), 3, 1, 1),
+                    nn.PixelShuffle(f),
+                    nn.PReLU(),
+                )
+                for f in up_factors
+            ]
+        )
+        self.conv_out = nn.Conv2d(base_ch, in_ch, 3, 1, 1)
+
+    def forward(self, x):
+        x = self.conv_in(x)
+        x = self.res_blocks(x)
+        for u in self.ups:
+            x = u(x)
+        x = self.conv_out(x)
+
+        # --- FIX: Add this line to force the final output size ---
+        return transforms.functional.resize(x, [160, 160], antialias=True)
+
+
+# ============================================================
+# EdgeFace Wrapper
+# ============================================================
+class EdgeFaceWrapper(nn.Module):
+    def __init__(self, weights_path):
+        super().__init__()
+
+        # This part correctly builds the base model architecture
+        self.model = get_model("edgenext_small", featdim=512)
+        self.model = replace_linear_with_lowrank_2(self.model, rank_ratio=0.5)
+
+        # Load the pre-trained weights from the file
+        state_dict = torch.load(weights_path, map_location="cpu")
+
+        # --- FIX: Strip the outer "model." prefix from each key ---
+        state_dict = torch.load(weights_path, map_location="cpu")
+
+        # Fix key mismatch: add "model." prefix if missing
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if not k.startswith("model."):
+                new_state_dict["model." + k] = v
+            else:
+                new_state_dict[k] = v
+
+        self.model.load_state_dict(new_state_dict, strict=False)
+
+        self.model.eval()
+
+        # Define the preprocessing transformation
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((EDGEFACE_INPUT_SIZE, EDGEFACE_INPUT_SIZE)),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
         )
 
-        return vlr_tensor, hr_tensor, torch.tensor(label, dtype=torch.long)
+    @torch.no_grad()
+    def get_embeddings(self, imgs_torch):
+        imgs_transformed = self.transform(imgs_torch)
+        return self.model(imgs_transformed)
 
 
-# ==============================================================================
-#  Main Training Block
-# ==============================================================================
-if __name__ == "__main__":
-    # --- Configuration ---
-    EPOCHS = 50
-    LEARNING_RATE = 0.001
-    BATCH_SIZE = 16  # Adjust based on your GPU memory
-    GAMMA = 0.01  # Weight for discriminative loss
-    TRAIN_DATA_DIR = "dataset/train_processed"
-
-    # --- Setup ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # --- Data Loading ---
-    print("Loading dataset...")
-    train_dataset = FaceSuperResDataset(data_dir=TRAIN_DATA_DIR)
-    # Note: For triplet loss, it's better to use a sampler that ensures each batch
-    # has multiple instances of the same class. For simplicity, we use standard shuffle.
+# ============================================================
+# Training
+# ============================================================
+def train():
+    train_ds = PairedFaceSRDataset(TRAIN_DIR)
+    val_ds = PairedFaceSRDataset(VAL_DIR)
     train_loader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4
+        train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS
     )
-    print("Dataset loaded.")
+    val_loader = DataLoader(
+        val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS
+    )
 
-    # --- Model Initialization ---
-    model = DSRModel(upscale_factor=10).to(device)
-    criterion = DSRLoss(gamma=GAMMA).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    model = DSRColor().to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    # --- Training Loop ---
-    print("Starting training...")
+    l1_loss = nn.L1Loss()
+    cosine_loss = nn.CosineEmbeddingLoss()
+
+    print("Using device:", DEVICE)
+    print("")
+
+    print("Loading EdgeFace...")
+    identity_model = EdgeFaceWrapper(EDGEFACE_WEIGHTS_PATH).to(DEVICE)
+
+    best_val_psnr = 0.0
     for epoch in range(EPOCHS):
         model.train()
-        running_loss = 0.0
+        for vlr, hr in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} Train"):
+            vlr, hr = vlr.to(DEVICE), hr.to(DEVICE)
+            pred = model(vlr)
+            pred_clamped = torch.clamp(pred, 0, 1)
 
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
-        for vlr_images, hr_images, labels in progress_bar:
-            vlr_images = vlr_images.to(device)
-            hr_images = hr_images.to(device)
-            labels = labels.to(device)
+            l_pix = l1_loss(pred_clamped, hr)
 
-            # Forward pass
-            predicted_hr = model(vlr_images)
-            loss = criterion(predicted_hr, hr_images, labels)
+            emb_sr = identity_model.get_embeddings(pred_clamped)
+            emb_hr = identity_model.get_embeddings(hr)
+            target = torch.ones(emb_sr.size(0)).to(DEVICE)
+            l_id = cosine_loss(emb_sr, emb_hr, target)
 
-            # Backward pass and optimization
+            loss = l_pix + LAMBDA_ID * l_id
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            running_loss += loss.item()
-            progress_bar.set_postfix(loss=f"{loss.item():.4f}")
+        model.eval()
+        val_loss, val_psnr = 0.0, 0.0
+        with torch.no_grad():
+            for vlr, hr in tqdm(val_loader, desc=f"Epoch {epoch+1}/{EPOCHS} Val"):
+                vlr, hr = vlr.to(DEVICE), hr.to(DEVICE)
+                pred = model(vlr)
+                pred_clamped = torch.clamp(pred, 0, 1)
 
-        epoch_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch+1} Loss: {epoch_loss:.4f}")
+                l_pix = l1_loss(pred_clamped, hr)
+                emb_sr = identity_model.get_embeddings(pred_clamped)
+                emb_hr = identity_model.get_embeddings(hr)
+                target = torch.ones(emb_sr.size(0)).to(DEVICE)
+                l_id = cosine_loss(emb_sr, emb_hr, target)
 
-    # --- Save the Trained Model ---
-    torch.save(model.state_dict(), "dsr_model.pth")
-    print("Training complete. Model saved as dsr_model.pth")
+                loss = l_pix + LAMBDA_ID * l_id
+                val_loss += loss.item()
+                val_psnr += compute_psnr(pred_clamped, hr)
+
+        avg_val_loss = val_loss / len(val_loader)
+        avg_val_psnr = val_psnr / len(val_loader)
+
+        print(f"Epoch {epoch+1}: Val Loss={avg_val_loss:.4f} PSNR={avg_val_psnr:.2f}dB")
+
+        scheduler.step()
+
+        if avg_val_psnr > best_val_psnr:
+            best_val_psnr = avg_val_psnr
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "epoch": epoch + 1,
+                    "val_psnr": avg_val_psnr,
+                },
+                SAVE_PATH,
+            )
+            print(f"✅ Saved best model to {SAVE_PATH} (PSNR: {avg_val_psnr:.2f}dB)")
+
+    print(f"Training complete. Best validation PSNR: {best_val_psnr:.2f}dB")
+
+
+if __name__ == "__main__":
+    train()
