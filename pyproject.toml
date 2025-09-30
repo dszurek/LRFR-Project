@@ -14,6 +14,11 @@ torch = { path = "technical/local_packages/torch-2.8.0+cu129-cp313-cp313-win_amd
 torchvision = { path = "technical/local_packages/torchvision-0.23.0+cu129-cp313-cp313-win_amd64.whl"}
 scikit-image = "^0.25.2"
 scipy = "^1.16.2"
+Pillow = "^10.4.0"
+pytest = "^8.4.2"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
