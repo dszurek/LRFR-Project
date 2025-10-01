@@ -57,19 +57,21 @@ from ..facial_rec.edgeface_weights.edgeface import EdgeFace
 class TrainConfig:
     """Hyper-parameters controlling training."""
 
-    epochs: int = 120
+    epochs: int = 80
     batch_size: int = 16
     learning_rate: float = 2e-4
     weight_decay: float = 1e-6
     lambda_l1: float = 1.0
-    lambda_perceptual: float = 0.05
-    lambda_identity: float = 0.1
-    lambda_tv: float = 1e-5
+    lambda_perceptual: float = 0.03  # Reduced - was fighting identity preservation
+    lambda_identity: float = 0.35  # Increased significantly - prioritize recognition
+    lambda_tv: float = 5e-6  # Slightly reduced to allow more high-freq detail
     grad_clip: float = 1.0
     ema_decay: float = 0.999
     num_workers: int = 8
     val_interval: int = 1
     seed: int = 42
+    warmup_epochs: int = 3  # Gradual warmup for stability
+    early_stop_patience: int = 15  # Stop if no improvement for 15 epochs
 
 
 # ---------------------------------------------------------------------------
@@ -122,21 +124,22 @@ class PairedFaceSRDataset(Dataset):
     def _apply_shared_augmentations(
         vlr: Image.Image, hr: Image.Image
     ) -> Tuple[Image.Image, Image.Image]:
-        # Horizontal flip
+        # Horizontal flip - safe for face recognition
         if random.random() < 0.5:
             vlr = TF.hflip(vlr)
             hr = TF.hflip(hr)
 
-        # Small rotations keep facial structure intact
-        angle = random.uniform(-8.0, 8.0)
-        vlr = TF.rotate(vlr, angle, interpolation=InterpolationMode.BILINEAR)
-        hr = TF.rotate(hr, angle, interpolation=InterpolationMode.BILINEAR)
+        # More conservative rotations to preserve facial features
+        if random.random() < 0.6:  # Only apply 60% of the time
+            angle = random.uniform(-5.0, 5.0)  # Reduced from ±8
+            vlr = TF.rotate(vlr, angle, interpolation=InterpolationMode.BILINEAR)
+            hr = TF.rotate(hr, angle, interpolation=InterpolationMode.BILINEAR)
 
-        # Mild colour jitter applied consistently
-        if random.random() < 0.3:
-            brightness = random.uniform(0.9, 1.1)
-            contrast = random.uniform(0.9, 1.1)
-            saturation = random.uniform(0.95, 1.05)
+        # Very mild colour jitter - too much breaks identity embeddings
+        if random.random() < 0.25:  # Reduced probability
+            brightness = random.uniform(0.95, 1.05)  # Tighter range
+            contrast = random.uniform(0.95, 1.05)  # Tighter range
+            saturation = random.uniform(0.97, 1.03)  # Much tighter range
             vlr = TF.adjust_brightness(vlr, brightness)
             hr = TF.adjust_brightness(hr, brightness)
             vlr = TF.adjust_contrast(vlr, contrast)
@@ -303,7 +306,8 @@ def set_random_seed(seed: int) -> None:
 
 
 def build_dsr_model(device: torch.device) -> nn.Module:
-    config = DSRConfig(base_channels=96, residual_blocks=16)
+    # Increased capacity for better feature learning
+    config = DSRConfig(base_channels=112, residual_blocks=16)
     model = DSRColor(config=config).to(device)
     return model
 
@@ -348,10 +352,25 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
     optimizer = optim.AdamW(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
+
+    # Warmup + cosine schedule for better convergence
+    def lr_lambda(epoch: int) -> float:
+        if epoch < config.warmup_epochs:
+            return (epoch + 1) / config.warmup_epochs
+        return 0.5 * (
+            1.0
+            + math.cos(
+                math.pi
+                * (epoch - config.warmup_epochs)
+                / (config.epochs - config.warmup_epochs)
+            )
+        )
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     scaler = GradScaler(enabled=device.type == "cuda")
 
     best_val_psnr = -math.inf
+    epochs_without_improvement = 0
 
     print(f"Using device: {device}")
     print(f"Training samples: {len(train_ds)}, validation samples: {len(val_ds)}")
@@ -451,6 +470,7 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
 
             if val_psnr > best_val_psnr:
                 best_val_psnr = val_psnr
+                epochs_without_improvement = 0
                 checkpoint = {
                     "epoch": epoch + 1,
                     "config": asdict(config),
@@ -462,6 +482,14 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
                 print(
                     f"✅ Saved new best checkpoint to {save_path} (val PSNR {val_psnr:.2f}dB)"
                 )
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= config.early_stop_patience:
+                    print(
+                        f"\n⚠️  Early stopping triggered after {epoch + 1} epochs (no improvement for {config.early_stop_patience} epochs)"
+                    )
+                    print(f"Best validation PSNR: {best_val_psnr:.2f}dB")
+                    break
         else:
             print(
                 f"Epoch {epoch + 1:03d} | train_loss={avg_train_loss:.4f} "
