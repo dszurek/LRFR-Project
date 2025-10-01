@@ -85,15 +85,74 @@ class DSRColor(nn.Module):
         return transforms.functional.resize(x, self.config.output_size, antialias=True)
 
 
-def _load_checkpoint(weights_path: Path | str, device: torch.device) -> dict:
+def _load_checkpoint(
+    weights_path: Path | str, device: torch.device
+) -> tuple[dict[str, torch.Tensor], dict]:
+    """Return the checkpoint state dict along with raw metadata."""
+
     checkpoint = torch.load(Path(weights_path), map_location=device)
+
+    state_dict: Optional[dict[str, torch.Tensor]] = None
+    metadata: dict = {}
+
     if isinstance(checkpoint, dict):
+        # Preserve auxiliary entries (e.g. config, epoch)
+        metadata = checkpoint
         for key in ("model_state_dict", "state_dict"):
-            if key in checkpoint:
-                return checkpoint[key]
-    if isinstance(checkpoint, dict):
-        return checkpoint
-    raise ValueError(f"Unsupported checkpoint format at {weights_path}")
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                state_dict = value  # type: ignore[assignment]
+                break
+        if state_dict is None:
+            # Heuristic: assume tensor-only dict is already a state dict
+            tensor_items = {
+                k: v for k, v in checkpoint.items() if isinstance(v, torch.Tensor)
+            }
+            if tensor_items:
+                state_dict = tensor_items
+    elif hasattr(checkpoint, "state_dict"):
+        state_dict = checkpoint.state_dict()
+        metadata = {
+            "config": getattr(checkpoint, "config", None),
+        }
+    else:
+        raise ValueError(f"Unsupported checkpoint format at {weights_path}")
+
+    if state_dict is None:
+        raise ValueError(f"No state_dict found inside checkpoint {weights_path}")
+
+    return state_dict, metadata
+
+
+def _strip_prefixes(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    cleaned: dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        new_key = key
+        for prefix in ("model.", "module."):
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix) :]
+        cleaned[new_key] = value
+    return cleaned
+
+
+def _infer_dsr_config(state: dict[str, torch.Tensor]) -> DSRConfig:
+    """Infer DSRConfig fields from checkpoint tensor shapes."""
+
+    base_channels = 64
+    conv_in = state.get("conv_in.weight")
+    if isinstance(conv_in, torch.Tensor):
+        base_channels = conv_in.shape[0]
+
+    residual_block_indices = set()
+    for key in state:
+        if key.startswith("residual_blocks"):
+            parts = key.split(".")
+            if len(parts) > 1 and parts[1].isdigit():
+                residual_block_indices.add(int(parts[1]))
+
+    residual_blocks = max(residual_block_indices) + 1 if residual_block_indices else 8
+
+    return DSRConfig(base_channels=base_channels, residual_blocks=residual_blocks)
 
 
 def load_dsr_model(
@@ -105,8 +164,28 @@ def load_dsr_model(
     """Instantiate and load the DSR model on the requested device."""
 
     device = torch.device(device)
-    model = DSRColor(config=config)
-    state_dict = _load_checkpoint(weights_path, device)
+    state_dict, metadata = _load_checkpoint(weights_path, device)
+
+    state_dict = _strip_prefixes(state_dict)
+
+    effective_config = config
+    if effective_config is None:
+        meta_config = None
+        if isinstance(metadata, dict):
+            meta_config = metadata.get("config")
+        if meta_config and hasattr(DSRConfig, "__dataclass_fields__"):
+            allowed = set(DSRConfig.__dataclass_fields__.keys())
+            # Only accept metadata if it actually contains DSRConfig fields.
+            filtered = {k: v for k, v in meta_config.items() if k in allowed}
+            if filtered:
+                try:
+                    effective_config = DSRConfig(**filtered)
+                except Exception:
+                    effective_config = None
+        if effective_config is None:
+            effective_config = _infer_dsr_config(state_dict)
+
+    model = DSRColor(config=effective_config)
 
     missing, unexpected = model.load_state_dict(state_dict, strict=strict)
     if missing and not strict:

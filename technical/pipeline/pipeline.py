@@ -30,8 +30,14 @@ except ModuleNotFoundError:  # pragma: no cover - executed only on dev host
     F = None  # type: ignore[assignment]
     transforms = None  # type: ignore[assignment]
 
-from dsr import DSRColor, DSRConfig, load_dsr_model
-from facial_rec.edgeface_weights.edgeface import EdgeFace
+try:
+    from technical.dsr import DSRColor, DSRConfig, load_dsr_model
+    from technical.facial_rec.edgeface_weights.edgeface import EdgeFace
+except (
+    ModuleNotFoundError
+):  # pragma: no cover - fallback for direct execution inside technical/
+    from dsr import DSRColor, DSRConfig, load_dsr_model
+    from facial_rec.edgeface_weights.edgeface import EdgeFace
 
 TensorLike = Union["torch.Tensor", np.ndarray]
 ImageInput = Union[str, Path, Image.Image, TensorLike]
@@ -52,10 +58,13 @@ class PipelineConfig:
     dsr_weights_path: Path = Path("dsr/dsr.pth")
     edgeface_weights_path: Path = Path("facial_rec/edgeface_weights/edgeface_xxs_q.pt")
     device: Union[str, Any] = "cpu"
-    recognition_threshold: float = 0.45
+    recognition_threshold: float = 0.35  # Lowered from 0.45 based on evaluation results
     gallery_normalize: bool = True
     num_threads: Optional[int] = 2
     force_full_precision: bool = True  # disable fp16 for embedded CPUs
+    use_tta: bool = (
+        False  # Test-time augmentation (flip horizontal) for better embeddings
+    )
 
 
 class IdentityDatabase:
@@ -119,18 +128,27 @@ class FaceRecognitionPipeline:
             normalize_embeddings=config.gallery_normalize,
         )
 
+        base_dir = Path(__file__).resolve().parents[1]
+        dsr_path = Path(config.dsr_weights_path)
+        if not dsr_path.is_absolute():
+            candidate = base_dir / dsr_path
+            dsr_path = candidate if candidate.exists() else dsr_path
+
+        edgeface_path = Path(config.edgeface_weights_path)
+        if not edgeface_path.is_absolute():
+            candidate = base_dir / edgeface_path
+            edgeface_path = candidate if candidate.exists() else edgeface_path
+
         if config.num_threads is not None:
             max_threads = os.cpu_count() or config.num_threads
             torch.set_num_threads(max(1, min(config.num_threads, max_threads)))
 
-        self.dsr_model = dsr_model or load_dsr_model(
-            config.dsr_weights_path, device=self.device
-        )
+        self.dsr_model = dsr_model or load_dsr_model(dsr_path, device=self.device)
         if config.force_full_precision:
             self.dsr_model = self.dsr_model.to(dtype=torch.float32)
 
         self.recognition_model = recognition_model or self._load_edgeface_model(
-            config.edgeface_weights_path
+            edgeface_path
         )
         self.recognition_model.to(self.device)
         if config.force_full_precision:
@@ -211,11 +229,23 @@ class FaceRecognitionPipeline:
             output = self.dsr_model(tensor)
         return torch.clamp(output, 0.0, 1.0)
 
-    def infer_embedding(self, high_res_tensor: Any) -> Any:
+    def infer_embedding(
+        self, high_res_tensor: Any, use_tta: Optional[bool] = None
+    ) -> Any:
         _require_torch()
+        use_tta = use_tta if use_tta is not None else self.config.use_tta
+
         transformed = self.preprocess(high_res_tensor)
         with torch.inference_mode():
             embedding = self.recognition_model(transformed)
+
+            if use_tta:
+                # Test-time augmentation: average with horizontally flipped version
+                flipped = torch.flip(transformed, dims=[-1])  # Flip width dimension
+                embedding_flip = self.recognition_model(flipped)
+                # Average embeddings before normalization for better stability
+                embedding = (embedding + embedding_flip) / 2.0
+
         if embedding.ndim == 2:
             embedding = embedding.squeeze(0)
         if embedding.ndim != 1:
