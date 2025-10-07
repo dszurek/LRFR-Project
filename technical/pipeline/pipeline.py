@@ -24,8 +24,8 @@ from PIL import Image
 try:  # Torch might not be available in the VS Code analysis environment
     import torch
     import torch.nn.functional as F
-    from torchvision import transforms
-except ModuleNotFoundError:  # pragma: no cover - executed only on dev host
+    from torchvision import transforms as transforms
+except ImportError:
     torch = None  # type: ignore[assignment]
     F = None  # type: ignore[assignment]
     transforms = None  # type: ignore[assignment]
@@ -56,7 +56,9 @@ class PipelineConfig:
     """Runtime configuration for the face pipeline."""
 
     dsr_weights_path: Path = Path("dsr/dsr.pth")
-    edgeface_weights_path: Path = Path("facial_rec/edgeface_weights/edgeface_xxs_q.pt")
+    edgeface_weights_path: Path = Path(
+        "facial_rec/edgeface_weights/edgeface_finetuned.pth"
+    )
     device: Union[str, Any] = "cpu"
     recognition_threshold: float = 0.35  # Lowered from 0.45 based on evaluation results
     gallery_normalize: bool = True
@@ -172,7 +174,67 @@ class FaceRecognitionPipeline:
             pass
 
         model = EdgeFace(back="edgeface_s")  # default backbone
-        state_dict = torch.load(resolved, map_location="cpu")
+        try:
+            # Try safe (weights-only) load first (PyTorch may default to weights_only=True).
+            # If that fails because the file contains pickled objects, retry allowing pickles.
+            state_dict = torch.load(resolved, map_location="cpu")
+        except Exception as e:
+            msg = str(e)
+            if (
+                "Weights only load failed" in msg
+                or "UnpicklingError" in msg
+                or "unsupported" in msg
+            ):
+                print(
+                    "[EdgeFace] weights-only load failed; attempting controlled retry with pickles allowed."
+                )
+                # The checkpoint was saved from __main__ context (finetune script run directly),
+                # so unpickler looks for __main__.FinetuneConfig. We create a stub in __main__
+                # to let unpickler resolve the reference, then retry loading with weights_only=False.
+                import sys
+                import importlib
+
+                try:
+                    # Import the real FinetuneConfig from finetune module
+                    finetune_mod = importlib.import_module(
+                        "technical.facial_rec.finetune_edgeface"
+                    )
+                    if hasattr(finetune_mod, "FinetuneConfig"):
+                        # Inject into __main__ so unpickler can find __main__.FinetuneConfig
+                        main_module = sys.modules.get("__main__")
+                        if main_module and not hasattr(main_module, "FinetuneConfig"):
+                            setattr(
+                                main_module,
+                                "FinetuneConfig",
+                                getattr(finetune_mod, "FinetuneConfig"),
+                            )
+                except Exception as import_err:
+                    # If import fails, create a minimal stub dataclass in __main__
+                    print(
+                        f"[EdgeFace] could not import FinetuneConfig ({import_err}); creating stub."
+                    )
+                    try:
+                        from dataclasses import dataclass
+
+                        main_module = sys.modules.get("__main__")
+                        if main_module and not hasattr(main_module, "FinetuneConfig"):
+
+                            @dataclass
+                            class FinetuneConfig:
+                                """Stub for unpickling fine-tuned checkpoint."""
+
+                                pass
+
+                            setattr(main_module, "FinetuneConfig", FinetuneConfig)
+                    except Exception:
+                        pass
+
+                # Warning: weights_only=False can execute arbitrary code from the file.
+                state_dict = torch.load(
+                    resolved, map_location="cpu", weights_only=False
+                )
+            else:
+                raise
         if "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
         elif "model_state_dict" in state_dict:
