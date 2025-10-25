@@ -55,23 +55,25 @@ from ..facial_rec.edgeface_weights.edgeface import EdgeFace
 
 @dataclass
 class TrainConfig:
-    """Hyper-parameters controlling training."""
+    """Hyper-parameters controlling training with fine-tuned EdgeFace."""
 
-    epochs: int = 80
+    epochs: int = 100  # Increased for better convergence with stricter losses
     batch_size: int = 16
-    learning_rate: float = 2e-4
+    learning_rate: float = 1.5e-4  # Slightly reduced for more stable fine-tuning
     weight_decay: float = 1e-6
     lambda_l1: float = 1.0
-    lambda_perceptual: float = 0.03  # Reduced - was fighting identity preservation
-    lambda_identity: float = 0.35  # Increased significantly - prioritize recognition
-    lambda_tv: float = 5e-6  # Slightly reduced to allow more high-freq detail
+    lambda_perceptual: float = 0.02  # Reduced further - identity is priority
+    lambda_identity: float = 0.50  # Increased from 0.35 - strongest signal
+    lambda_feature_match: float = 0.15  # NEW: intermediate feature matching
+    lambda_tv: float = 3e-6  # Reduced to allow sharper facial features
     grad_clip: float = 1.0
     ema_decay: float = 0.999
     num_workers: int = 8
     val_interval: int = 1
     seed: int = 42
-    warmup_epochs: int = 3  # Gradual warmup for stability
-    early_stop_patience: int = 15  # Stop if no improvement for 15 epochs
+    warmup_epochs: int = 5  # Longer warmup for stability with higher identity loss
+    early_stop_patience: int = 20  # More patience for slower convergence
+    use_multiscale_perceptual: bool = True  # Multi-scale perceptual loss
 
 
 # ---------------------------------------------------------------------------
@@ -156,23 +158,27 @@ class PairedFaceSRDataset(Dataset):
 
 
 class VGGPerceptualLoss(nn.Module):
-    """Perceptual loss built from frozen VGG19 feature activations."""
+    """Multi-scale perceptual loss from VGG19 with optional intermediate features."""
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, multiscale: bool = True) -> None:
         super().__init__()
         weights = VGG19_Weights.IMAGENET1K_V1
         vgg_features = vgg19(weights=weights).features.eval()
         for param in vgg_features.parameters():
             param.requires_grad_(False)
 
+        # Extract features at multiple depths for better structure preservation
         self.slices = nn.ModuleList(
             [
-                nn.Sequential(*vgg_features[:4]),
-                nn.Sequential(*vgg_features[4:9]),
-                nn.Sequential(*vgg_features[9:18]),
+                nn.Sequential(*vgg_features[:4]),  # relu1_2: low-level edges
+                nn.Sequential(*vgg_features[4:9]),  # relu2_2: textures
+                nn.Sequential(*vgg_features[9:18]),  # relu3_4: mid-level structures
+                nn.Sequential(*vgg_features[18:27]),  # relu4_4: high-level features
             ]
         )
         self.slices.to(device)
+        self.multiscale = multiscale
+
         self.register_buffer(
             "mean",
             torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1),
@@ -187,12 +193,17 @@ class VGGPerceptualLoss(nn.Module):
     def forward(self, sr: torch.Tensor, hr: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         sr_norm = (sr - self.mean) / self.std
         hr_norm = (hr - self.mean) / self.std
+
         loss = torch.zeros(1, device=sr.device)
         x, y = sr_norm, hr_norm
-        for block in self.slices:
+
+        # Weight early layers more for facial structure
+        weights = [0.4, 0.3, 0.2, 0.1] if self.multiscale else [0.25, 0.25, 0.25, 0.25]
+
+        for i, block in enumerate(self.slices):
             x = block(x)
             y = block(y)
-            loss = loss + F.l1_loss(x, y)
+            loss = loss + weights[i] * F.l1_loss(x, y)
         return loss
 
 
@@ -238,16 +249,45 @@ class ModelEMA:
 
 
 class EdgeFaceEmbedding(nn.Module):
-    """Wraps EdgeFace to provide frozen embeddings for identity loss."""
+    """Wraps fine-tuned EdgeFace to provide embeddings + intermediate features for feature matching."""
 
-    def __init__(self, weights_path: Path, device: torch.device) -> None:
+    def __init__(
+        self, weights_path: Path, device: torch.device, extract_features: bool = True
+    ) -> None:
         super().__init__()
         self.model = EdgeFace(back="edgeface_s")
-        raw_state = torch.load(weights_path, map_location="cpu")
+        self.extract_features = extract_features
+
+        # Load checkpoint - handle both fine-tuned and original formats
+        try:
+            raw_state = torch.load(weights_path, map_location="cpu", weights_only=False)
+        except Exception:
+            # Fallback for weights-only load issues
+            import sys
+            from dataclasses import dataclass
+
+            # Create stub for unpickling fine-tuned checkpoints
+            main_module = sys.modules.get("__main__")
+            if main_module and not hasattr(main_module, "FinetuneConfig"):
+
+                @dataclass
+                class FinetuneConfig:
+                    """Stub for unpickling."""
+
+                    pass
+
+                setattr(main_module, "FinetuneConfig", FinetuneConfig)
+
+            raw_state = torch.load(weights_path, map_location="cpu", weights_only=False)
+
         if isinstance(raw_state, torch.jit.ScriptModule):
             state_dict = raw_state.state_dict()
         elif isinstance(raw_state, dict):
-            if "state_dict" in raw_state:
+            # Handle fine-tuned checkpoint format (has 'backbone_state_dict')
+            if "backbone_state_dict" in raw_state:
+                state_dict = raw_state["backbone_state_dict"]
+                print("[EdgeFace] Loaded fine-tuned backbone weights")
+            elif "state_dict" in raw_state:
                 state_dict = raw_state["state_dict"]
             elif "model_state_dict" in raw_state:
                 state_dict = raw_state["model_state_dict"]
@@ -285,11 +325,81 @@ class EdgeFaceEmbedding(nn.Module):
             ]
         )
 
+        # For feature matching: extract intermediate features from EdgeFace
+        if self.extract_features:
+            self._register_feature_hooks()
+            self.intermediate_features_sr = []
+            self.intermediate_features_hr = []
+
+    def _register_feature_hooks(self) -> None:
+        """Register forward hooks to capture intermediate features for feature matching."""
+
+        def get_activation(name: str, storage: List):
+            def hook(module, input, output):
+                storage.append(output.detach())
+
+            return hook
+
+        # Hook into key layers of EdgeFace features network
+        # EdgeFace architecture: stem -> stages -> flatten -> linear -> bn
+        if hasattr(self.model, "features"):
+            # Access intermediate blocks (adjust indices based on EdgeFace structure)
+            try:
+                # Hook early, mid, late feature layers for multi-scale matching
+                self.model.features[0].register_forward_hook(
+                    get_activation("early", self.intermediate_features_sr)
+                )
+                if len(self.model.features) > 5:
+                    self.model.features[5].register_forward_hook(
+                        get_activation("mid", self.intermediate_features_sr)
+                    )
+                if len(self.model.features) > 10:
+                    self.model.features[10].register_forward_hook(
+                        get_activation("late", self.intermediate_features_sr)
+                    )
+            except Exception:
+                # If hooking fails, disable feature extraction
+                self.extract_features = False
+                print(
+                    "[EdgeFace] Could not register feature hooks; disabling feature matching"
+                )
+
     @torch.no_grad()
     def forward(self, imgs: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         processed = self.transform(imgs)
+
+        # Clear previous features
+        if self.extract_features:
+            self.intermediate_features_sr.clear()
+            self.intermediate_features_hr.clear()
+
         embeddings = self.model(processed)
         return F.normalize(embeddings, dim=-1)
+
+    @torch.no_grad()
+    def extract_paired_features(
+        self, sr: torch.Tensor, hr: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, List, List]:
+        """Extract embeddings and intermediate features for both SR and HR."""
+        self.intermediate_features_sr.clear()
+        self.intermediate_features_hr.clear()
+
+        sr_processed = self.transform(sr)
+        hr_processed = self.transform(hr)
+
+        emb_sr = self.model(sr_processed)
+        sr_features = list(self.intermediate_features_sr)
+
+        self.intermediate_features_sr.clear()
+        emb_hr = self.model(hr_processed)
+        hr_features = list(self.intermediate_features_hr)
+
+        return (
+            F.normalize(emb_sr, dim=-1),
+            F.normalize(emb_hr, dim=-1),
+            sr_features,
+            hr_features,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +434,9 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     set_random_seed(config.seed)
 
+    print(f"Using device: {device}")
+    print(f"Loading fine-tuned EdgeFace from: {weights_path}")
+
     train_ds = PairedFaceSRDataset(train_dir, augment=True)
     val_ds = PairedFaceSRDataset(val_dir, augment=False)
     train_loader = DataLoader(
@@ -344,10 +457,12 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
     model = build_dsr_model(device)
     ema = ModelEMA(model, decay=config.ema_decay)
 
-    identity_model = EdgeFaceEmbedding(weights_path, device)
+    identity_model = EdgeFaceEmbedding(weights_path, device, extract_features=True)
     l1_loss = nn.L1Loss()
     cosine_loss = nn.CosineEmbeddingLoss()
-    perceptual_loss = VGGPerceptualLoss(device)
+    perceptual_loss = VGGPerceptualLoss(
+        device, multiscale=config.use_multiscale_perceptual
+    )
 
     optimizer = optim.AdamW(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
@@ -372,14 +487,28 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
     best_val_psnr = -math.inf
     epochs_without_improvement = 0
 
-    print(f"Using device: {device}")
     print(f"Training samples: {len(train_ds)}, validation samples: {len(val_ds)}")
     print("Saving best checkpoints to", save_path)
+    print(f"\nTraining configuration:")
+    print(f"  - Identity loss weight: {config.lambda_identity}")
+    print(f"  - Feature matching weight: {config.lambda_feature_match}")
+    print(f"  - Perceptual loss weight: {config.lambda_perceptual}")
+    print(f"  - Multi-scale perceptual: {config.use_multiscale_perceptual}")
+    print(f"  - Epochs: {config.epochs}, Warmup: {config.warmup_epochs}")
+    print(f"  - Early stop patience: {config.early_stop_patience}\n")
 
     for epoch in range(config.epochs):
         model.train()
         running_loss = 0.0
         running_psnr = 0.0
+        running_losses = {
+            "l1": 0.0,
+            "perceptual": 0.0,
+            "identity": 0.0,
+            "feature_match": 0.0,
+            "tv": 0.0,
+        }
+
         progress = tqdm(
             train_loader, desc=f"Epoch {epoch + 1}/{config.epochs} [train]", leave=False
         )
@@ -394,18 +523,43 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
                 sr = model(vlr)
                 sr = torch.clamp(sr, 0.0, 1.0)
 
+                # Pixel-level reconstruction
                 loss_l1 = l1_loss(sr, hr)
+
+                # Perceptual loss (multi-scale VGG features)
                 loss_perc = perceptual_loss(sr, hr)
+
+                # Identity preservation (cosine embedding loss)
                 embeddings_sr = identity_model(sr)
                 embeddings_hr = identity_model(hr)
                 targets = torch.ones(embeddings_sr.size(0), device=device)
                 loss_id = cosine_loss(embeddings_sr, embeddings_hr, targets)
+
+                # Feature matching loss (intermediate EdgeFace features)
+                loss_feat = torch.zeros(1, device=device)
+                if config.lambda_feature_match > 0 and identity_model.extract_features:
+                    try:
+                        _, _, sr_feats, hr_feats = (
+                            identity_model.extract_paired_features(sr, hr)
+                        )
+                        for sf, hf in zip(sr_feats, hr_feats):
+                            if sf.shape == hf.shape:
+                                loss_feat = loss_feat + F.l1_loss(sf, hf)
+                        if len(sr_feats) > 0:
+                            loss_feat = loss_feat / len(sr_feats)
+                    except Exception:
+                        # Feature extraction failed; skip this loss
+                        pass
+
+                # Total variation regularization
                 loss_tv = total_variation_loss(sr)
 
+                # Combined loss with adjusted weights
                 loss = (
                     config.lambda_l1 * loss_l1
                     + config.lambda_perceptual * loss_perc
                     + config.lambda_identity * loss_id
+                    + config.lambda_feature_match * loss_feat
                     + config.lambda_tv * loss_tv
                 )
 
@@ -419,17 +573,31 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
 
             running_loss += loss.item()
             running_psnr += compute_psnr(sr.detach(), hr)
+            running_losses["l1"] += loss_l1.item()
+            running_losses["perceptual"] += loss_perc.item()
+            running_losses["identity"] += loss_id.item()
+            running_losses["feature_match"] += loss_feat.item()
+            running_losses["tv"] += loss_tv.item()
 
         scheduler.step()
 
         avg_train_loss = running_loss / len(train_loader)
         avg_train_psnr = running_psnr / len(train_loader)
+        avg_losses = {k: v / len(train_loader) for k, v in running_losses.items()}
 
         if (epoch + 1) % config.val_interval == 0:
             eval_model = ema.ema
             eval_model.eval()
             val_loss = 0.0
             val_psnr = 0.0
+            val_losses = {
+                "l1": 0.0,
+                "perceptual": 0.0,
+                "identity": 0.0,
+                "feature_match": 0.0,
+                "tv": 0.0,
+            }
+
             with torch.no_grad():
                 for vlr, hr in tqdm(
                     val_loader,
@@ -448,24 +616,56 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
                     embeddings_hr = identity_model(hr)
                     targets = torch.ones(embeddings_sr.size(0), device=device)
                     loss_id = cosine_loss(embeddings_sr, embeddings_hr, targets)
+
+                    loss_feat = torch.zeros(1, device=device)
+                    if (
+                        config.lambda_feature_match > 0
+                        and identity_model.extract_features
+                    ):
+                        try:
+                            _, _, sr_feats, hr_feats = (
+                                identity_model.extract_paired_features(sr, hr)
+                            )
+                            for sf, hf in zip(sr_feats, hr_feats):
+                                if sf.shape == hf.shape:
+                                    loss_feat = loss_feat + F.l1_loss(sf, hf)
+                            if len(sr_feats) > 0:
+                                loss_feat = loss_feat / len(sr_feats)
+                        except Exception:
+                            pass
+
                     loss_tv = total_variation_loss(sr)
 
                     total = (
                         config.lambda_l1 * loss_l1
                         + config.lambda_perceptual * loss_perc
                         + config.lambda_identity * loss_id
+                        + config.lambda_feature_match * loss_feat
                         + config.lambda_tv * loss_tv
                     )
                     val_loss += total.item()
                     val_psnr += compute_psnr(sr, hr)
+                    val_losses["l1"] += loss_l1.item()
+                    val_losses["perceptual"] += loss_perc.item()
+                    val_losses["identity"] += loss_id.item()
+                    val_losses["feature_match"] += loss_feat.item()
+                    val_losses["tv"] += loss_tv.item()
 
             val_loss /= len(val_loader)
             val_psnr /= len(val_loader)
+            val_losses = {k: v / len(val_loader) for k, v in val_losses.items()}
 
             print(
-                f"Epoch {epoch + 1:03d} | train_loss={avg_train_loss:.4f} "
-                f"train_psnr={avg_train_psnr:.2f}dB | val_loss={val_loss:.4f} "
-                f"val_psnr={val_psnr:.2f}dB"
+                f"Epoch {epoch + 1:03d} | "
+                f"train_loss={avg_train_loss:.4f} (L1:{avg_losses['l1']:.3f} P:{avg_losses['perceptual']:.3f} "
+                f"ID:{avg_losses['identity']:.3f} FM:{avg_losses['feature_match']:.3f}) "
+                f"PSNR={avg_train_psnr:.2f}dB"
+            )
+            print(
+                f"         | "
+                f"val_loss={val_loss:.4f} (L1:{val_losses['l1']:.3f} P:{val_losses['perceptual']:.3f} "
+                f"ID:{val_losses['identity']:.3f} FM:{val_losses['feature_match']:.3f}) "
+                f"PSNR={val_psnr:.2f}dB"
             )
 
             if val_psnr > best_val_psnr:
@@ -477,26 +677,30 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
                     "model_state_dict": ema.ema.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_psnr": val_psnr,
+                    "val_identity_loss": val_losses["identity"],
                 }
                 torch.save(checkpoint, save_path)
                 print(
-                    f"✅ Saved new best checkpoint to {save_path} (val PSNR {val_psnr:.2f}dB)"
+                    f"✅ Saved new best checkpoint (val PSNR {val_psnr:.2f}dB, ID loss {val_losses['identity']:.4f})"
                 )
             else:
                 epochs_without_improvement += 1
                 if epochs_without_improvement >= config.early_stop_patience:
                     print(
-                        f"\n⚠️  Early stopping triggered after {epoch + 1} epochs (no improvement for {config.early_stop_patience} epochs)"
+                        f"\n⚠️  Early stopping after {epoch + 1} epochs (no improvement for {config.early_stop_patience} epochs)"
                     )
                     print(f"Best validation PSNR: {best_val_psnr:.2f}dB")
                     break
         else:
             print(
-                f"Epoch {epoch + 1:03d} | train_loss={avg_train_loss:.4f} "
-                f"train_psnr={avg_train_psnr:.2f}dB"
+                f"Epoch {epoch + 1:03d} | "
+                f"train_loss={avg_train_loss:.4f} (L1:{avg_losses['l1']:.3f} P:{avg_losses['perceptual']:.3f} "
+                f"ID:{avg_losses['identity']:.3f} FM:{avg_losses['feature_match']:.3f}) "
+                f"PSNR={avg_train_psnr:.2f}dB"
             )
 
-    print(f"Training complete. Best validation PSNR: {best_val_psnr:.2f}dB")
+    print(f"\n🎉 Training complete! Best validation PSNR: {best_val_psnr:.2f}dB")
+    print(f"Checkpoint saved to: {save_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +709,9 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the DSR super-resolution model")
+    parser = argparse.ArgumentParser(
+        description="Train DSR super-resolution model with fine-tuned EdgeFace identity preservation"
+    )
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -513,8 +719,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--edgeface",
-        default="edgeface_xxs_q.pt",
-        help="Filename of the EdgeFace weights relative to technical/facial_rec/edgeface_weights",
+        default="edgeface_finetuned.pth",
+        help="Filename of the fine-tuned EdgeFace weights relative to technical/facial_rec/edgeface_weights",
     )
     parser.add_argument(
         "--epochs",
