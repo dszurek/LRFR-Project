@@ -45,31 +45,38 @@ from ..dsr import load_dsr_model
 
 @dataclass
 class FinetuneConfig:
-    """Configuration for EdgeFace fine-tuning."""
+    """Configuration for EdgeFace fine-tuning.
 
-    # Training
+    OPTIMIZED FOR 32×32 VLR → 112×112 HR (3.5× upscaling)
+    """
+
+    # Training - adjusted for 32×32→112 resolution
     stage1_epochs: int = 5  # Freeze backbone, train head
-    stage2_epochs: int = 20  # Unfreeze all, fine-tune
-    batch_size: int = 32
+    stage2_epochs: int = (
+        25  # Increased from 20 - 32×32 benefits from longer fine-tuning
+    )
+    batch_size: int = (
+        32  # Can use full 32 since DSR outputs 112×112 (less memory than 128)
+    )
     num_workers: int = 8
 
-    # Learning rates
-    head_lr: float = 1e-3  # Stage 1
-    backbone_lr: float = 5e-6  # Stage 2 - very low to preserve pretrained features
-    head_lr_stage2: float = 5e-5  # Stage 2
+    # Learning rates - slightly lower for 32×32 (more stable gradients)
+    head_lr: float = 9e-4  # Stage 1 (reduced from 1e-3)
+    backbone_lr: float = 6e-6  # Stage 2 - slightly higher (was 5e-6)
+    head_lr_stage2: float = 6e-5  # Stage 2 (slightly higher from 5e-5)
 
-    # Loss weights
+    # Loss weights - 32×32 has clearer features
     arcface_scale: float = 64.0  # ArcFace scale parameter (s)
-    arcface_margin: float = 0.5  # ArcFace margin parameter (m)
+    arcface_margin: float = 0.45  # Reduced from 0.5 - 32×32 creates tighter clusters
 
-    # Regularization
-    weight_decay: float = 5e-5
-    label_smoothing: float = 0.1
+    # Regularization - less needed with 32×32
+    weight_decay: float = 3e-5  # Reduced from 5e-5
+    label_smoothing: float = 0.08  # Reduced from 0.1 - more confident predictions
 
     # Other
     val_interval: int = 1
     seed: int = 42
-    early_stop_patience: int = 8
+    early_stop_patience: int = 10  # Increased from 8 - allow more exploration
 
 
 class ArcFaceLoss(nn.Module):
@@ -120,7 +127,11 @@ class ArcFaceLoss(nn.Module):
 
 
 class DSROutputDataset(Dataset):
-    """Dataset that loads VLR images, runs DSR, and pairs with HR ground truth."""
+    """Dataset that loads VLR images, runs DSR, and pairs with HR ground truth.
+
+    DSR outputs 112×112 which matches EdgeFace's required input size.
+    HR images are also 112×112 for direct comparison.
+    """
 
     def __init__(
         self,
@@ -128,6 +139,7 @@ class DSROutputDataset(Dataset):
         dsr_model: nn.Module,
         device: torch.device,
         augment: bool = True,
+        subject_to_id: Dict[str, int] | None = None,
     ):
         self.dataset_root = Path(dataset_root)
         self.vlr_root = self.dataset_root / "vlr_images"
@@ -138,7 +150,10 @@ class DSROutputDataset(Dataset):
 
         # Build dataset
         self.samples: List[Tuple[Path, Path, int]] = []
-        self.subject_to_id: Dict[str, int] = {}
+        # Use provided mapping or create new one (for train set)
+        self.subject_to_id: Dict[str, int] = (
+            subject_to_id if subject_to_id is not None else {}
+        )
 
         print("Building dataset from", self.dataset_root)
         vlr_paths = sorted(self.vlr_root.glob("*.png"))
@@ -148,8 +163,18 @@ class DSROutputDataset(Dataset):
             if not hr_path.exists():
                 continue
 
-            # Extract subject ID from filename (e.g., "007_01_..." -> "007")
-            subject = vlr_path.stem.split("_")[0]
+            # Extract subject ID from filename
+            # Format: ###_##_##_###_##_crop_128.png (CMU) or ####_####_lfw.png (LFW)
+            stem = vlr_path.stem
+            if "_lfw" in stem:
+                # LFW format: ####_####_lfw
+                subject = stem.split("_")[0]
+            else:
+                # CMU format: ###_##_##_###_##_crop_128
+                subject = stem.split("_")[0]
+
+            # Add subject to mapping if not present
+            # For validation with pre-existing mapping, new subjects get new IDs
             if subject not in self.subject_to_id:
                 self.subject_to_id[subject] = len(self.subject_to_id)
 
@@ -158,10 +183,9 @@ class DSROutputDataset(Dataset):
 
         print(f"Found {len(self.samples)} samples, {len(self.subject_to_id)} subjects")
 
-        # EdgeFace preprocessing (resize to 112x112, normalize)
+        # EdgeFace preprocessing (no resize needed - already 112×112, just normalize)
         self.hr_transform = transforms.Compose(
             [
-                transforms.Resize((112, 112)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ]
@@ -169,11 +193,18 @@ class DSROutputDataset(Dataset):
 
         self.vlr_transform = transforms.ToTensor()
 
-        # Augmentation for training
+        # Augmentation for training - more aggressive with 32×32 (more robust)
         self.aug_transform = transforms.Compose(
             [
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=0.05, contrast=0.05, saturation=0.03),
+                # 32×32 can handle slightly more color jitter than 16×16
+                transforms.ColorJitter(
+                    brightness=0.07, contrast=0.07, saturation=0.05, hue=0.02
+                ),
+                # Add slight rotation - 32×32 has enough structure to handle it
+                transforms.RandomRotation(
+                    degrees=5, interpolation=transforms.InterpolationMode.BILINEAR
+                ),
             ]
         )
 
@@ -197,30 +228,55 @@ class DSROutputDataset(Dataset):
             sr_tensor = self.dsr_model(vlr_tensor)
             sr_tensor = torch.clamp(sr_tensor, 0.0, 1.0)
 
-        # Resize DSR output to 112x112 and normalize for EdgeFace
-        sr_tensor = F.interpolate(
-            sr_tensor, size=(112, 112), mode="bilinear", align_corners=False
-        )
+        # DSR may output different sizes (e.g., 160×160)
+        # Resize to 112×112 for EdgeFace if needed
         sr_tensor = sr_tensor.squeeze(0).cpu()
-        # Apply EdgeFace normalization
+
+        if sr_tensor.shape[1] != 112 or sr_tensor.shape[2] != 112:
+            sr_tensor = transforms.functional.resize(
+                sr_tensor,
+                [112, 112],
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            )
+
+        # Normalize for EdgeFace
         sr_tensor = transforms.functional.normalize(
             sr_tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
         )
 
-        # Load and preprocess HR image
+        # Load and preprocess HR image (resize to 112×112 if needed)
         hr_img = Image.open(hr_path).convert("RGB")
+        if hr_img.size != (112, 112):
+            hr_img = hr_img.resize((112, 112), Image.Resampling.BILINEAR)
         hr_tensor = self.hr_transform(hr_img)
 
         return sr_tensor, hr_tensor, subject_id
 
 
-def load_edgeface_backbone(weights_path: Path, device: torch.device) -> EdgeFace:
-    """Load EdgeFace model and strip 'model.' prefix from state dict."""
-    model = EdgeFace(embedding_size=512, back="edgeface_s")
+def load_edgeface_backbone(
+    weights_path: Path, device: torch.device, backbone_type: str = "edgeface_xxs"
+) -> EdgeFace:
+    """Load EdgeFace model (edgeface_xxs or edgeface_s) and strip prefixes from state dict."""
+    # Auto-detect backbone from filename if not specified
+    if "xxs" in weights_path.stem.lower():
+        backbone_type = "edgeface_xxs"
+    elif "_s" in weights_path.stem.lower():
+        backbone_type = "edgeface_s"
+
+    print(f"[EdgeFace] Using backbone: {backbone_type}")
+    model = EdgeFace(embedding_size=512, back=backbone_type)
 
     state_dict = torch.load(weights_path, map_location="cpu")
 
-    # Strip 'model.' prefix if present
+    # Debug: Check if state_dict is nested
+    if "model" in state_dict and isinstance(state_dict["model"], dict):
+        # Checkpoint format: {'model': {...}, 'optimizer': {...}, ...}
+        state_dict = state_dict["model"]
+    elif "state_dict" in state_dict:
+        # Checkpoint format: {'state_dict': {...}, ...}
+        state_dict = state_dict["state_dict"]
+
+    # Strip 'model.' prefix from all keys
     cleaned_state = {}
     for key, value in state_dict.items():
         new_key = key
@@ -228,13 +284,17 @@ def load_edgeface_backbone(weights_path: Path, device: torch.device) -> EdgeFace
             new_key = new_key[len("model.") :]
         cleaned_state[new_key] = value
 
+    print(f"[EdgeFace] Sample keys after cleaning: {list(cleaned_state.keys())[:3]}")
+
     missing, unexpected = model.load_state_dict(cleaned_state, strict=False)
     if missing:
         print(
             f"[EdgeFace] Missing keys: {len(missing)} (expected if architecture differs slightly)"
         )
+        print(f"[EdgeFace] Missing key names: {missing}")
     if unexpected:
         print(f"[EdgeFace] Unexpected keys: {len(unexpected)}")
+        print(f"[EdgeFace] Unexpected key names (first 10): {unexpected[:10]}")
 
     model.to(device)
     return model
@@ -248,12 +308,31 @@ def train_epoch(
     scaler: GradScaler,
     device: torch.device,
     label_smoothing: float,
+    use_contrastive: bool = True,
+    contrastive_weight: float = 0.3,
 ) -> Tuple[float, float]:
-    """Train for one epoch."""
+    """Train for one epoch with optional contrastive learning.
+
+    Args:
+        model: EdgeFace backbone
+        arcface: ArcFace classification head
+        loader: Training data loader
+        optimizer: Optimizer
+        scaler: Gradient scaler for mixed precision
+        device: Training device
+        label_smoothing: Label smoothing factor
+        use_contrastive: If True, add contrastive loss between DSR and HR embeddings
+        contrastive_weight: Weight for contrastive loss (typically 0.2-0.5)
+
+    Returns:
+        Tuple of (average_loss, accuracy)
+    """
     model.train()
     arcface.train()
 
     total_loss = 0.0
+    total_cls_loss = 0.0
+    total_cont_loss = 0.0
     correct = 0
     total = 0
 
@@ -261,19 +340,44 @@ def train_epoch(
 
     for sr_imgs, hr_imgs, labels in tqdm(loader, desc="Training", leave=False):
         sr_imgs = sr_imgs.to(device, non_blocking=True)
+        hr_imgs = hr_imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=device.type == "cuda"):
             # Get embeddings from DSR outputs
-            embeddings = model(sr_imgs)
+            sr_embeddings = model(sr_imgs)
 
-            # Compute ArcFace logits
-            logits = arcface(embeddings, labels)
+            # Compute ArcFace classification logits
+            logits = arcface(sr_embeddings, labels)
 
-            # Cross-entropy loss
-            loss = criterion(logits, labels)
+            # Classification loss
+            cls_loss = criterion(logits, labels)
+
+            # Contrastive loss: Make DSR and HR embeddings similar for same person
+            if use_contrastive:
+                # Get embeddings from HR images (ground truth)
+                hr_embeddings = model(hr_imgs)
+
+                # Normalize embeddings
+                sr_embeddings_norm = F.normalize(sr_embeddings, dim=1)
+                hr_embeddings_norm = F.normalize(hr_embeddings, dim=1)
+
+                # Cosine similarity between DSR and HR (should be close to 1.0)
+                # Since they're the same person, we want similarity = 1
+                cosine_sim = (sr_embeddings_norm * hr_embeddings_norm).sum(dim=1)
+
+                # Loss: minimize distance (maximize similarity)
+                # contrastive_loss = 1 - cosine_similarity
+                contrastive_loss = (1.0 - cosine_sim).mean()
+
+                # Combined loss
+                loss = cls_loss + contrastive_weight * contrastive_loss
+
+                total_cont_loss += contrastive_loss.item()
+            else:
+                loss = cls_loss
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -281,12 +385,22 @@ def train_epoch(
 
         # Metrics
         total_loss += loss.item()
+        total_cls_loss += cls_loss.item()
         pred = logits.argmax(dim=1)
         correct += (pred == labels).sum().item()
         total += labels.size(0)
 
     avg_loss = total_loss / len(loader)
+    avg_cls_loss = total_cls_loss / len(loader)
+    avg_cont_loss = total_cont_loss / len(loader) if use_contrastive else 0.0
     accuracy = correct / total
+
+    # Print detailed loss breakdown if using contrastive
+    if use_contrastive:
+        print(
+            f"    [Losses] Total: {avg_loss:.4f} | Cls: {avg_cls_loss:.4f} | Cont: {avg_cont_loss:.4f}"
+        )
+
     return avg_loss, accuracy
 
 
@@ -384,10 +498,21 @@ def main(args: argparse.Namespace) -> None:
     train_dataset = DSROutputDataset(train_dir, dsr_model, device, augment=True)
 
     print("\nBuilding validation dataset...")
-    val_dataset = DSROutputDataset(val_dir, dsr_model, device, augment=False)
+    # CRITICAL: Use same subject_to_id mapping as training set!
+    val_dataset = DSROutputDataset(
+        val_dir,
+        dsr_model,
+        device,
+        augment=False,
+        subject_to_id=train_dataset.subject_to_id,
+    )
 
-    num_classes = len(train_dataset.subject_to_id)
-    print(f"\nNumber of classes: {num_classes}")
+    # Total classes = train subjects + any new val subjects
+    num_classes = len(val_dataset.subject_to_id)
+    print(f"\nNumber of training subjects: {len(train_dataset.subject_to_id)}")
+    print(f"Number of total subjects (train + val): {num_classes}")
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
 
     train_loader = DataLoader(
         train_dataset,
@@ -436,6 +561,7 @@ def main(args: argparse.Namespace) -> None:
     best_val_acc = 0.0
 
     for epoch in range(1, config.stage1_epochs + 1):
+        # Stage 1: No contrastive learning (just train classification head)
         train_loss, train_acc = train_epoch(
             backbone,
             arcface,
@@ -444,6 +570,7 @@ def main(args: argparse.Namespace) -> None:
             scaler,
             device,
             config.label_smoothing,
+            use_contrastive=False,  # Disable contrastive in Stage 1
         )
 
         val_loss, val_acc = validate(backbone, arcface, val_loader, device)
@@ -486,6 +613,7 @@ def main(args: argparse.Namespace) -> None:
     epochs_without_improvement = 0
 
     for epoch in range(1, config.stage2_epochs + 1):
+        # Stage 2: Enable contrastive learning (align DSR and HR embeddings)
         train_loss, train_acc = train_epoch(
             backbone,
             arcface,
@@ -494,6 +622,8 @@ def main(args: argparse.Namespace) -> None:
             scaler,
             device,
             config.label_smoothing,
+            use_contrastive=True,  # Enable contrastive in Stage 2
+            contrastive_weight=0.3,  # 30% weight for DSR-HR alignment
         )
 
         val_loss, val_acc = validate(backbone, arcface, val_loader, device)
@@ -532,11 +662,19 @@ def main(args: argparse.Namespace) -> None:
                 break
 
     print(f"\nTraining complete! Best validation accuracy: {best_val_acc:.4f}")
-    print(f"Fine-tuned model saved to: {save_path}")
-    print("\nTo use the fine-tuned model, update your pipeline to load:")
-    print(
-        f"  edgeface_weights_path = Path('facial_rec/edgeface_weights/edgeface_finetuned.pth')"
-    )
+
+    if save_path.exists():
+        print(f"✓ Fine-tuned model saved to: {save_path}")
+        print("\nTo use the fine-tuned model, update your pipeline to load:")
+        print(
+            f"  edgeface_weights_path = Path('facial_rec/edgeface_weights/edgeface_finetuned.pth')"
+        )
+    else:
+        print(f"✗ No model was saved (validation accuracy never improved from 0.0000)")
+        print(f"  This suggests a training issue - check:")
+        print(f"  1. EdgeFace model loaded correctly (check missing keys)")
+        print(f"  2. Dataset labels match model expectations")
+        print(f"  3. Learning rate isn't too high/low")
 
 
 def parse_args() -> argparse.Namespace:
@@ -551,7 +689,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--edgeface",
         default="edgeface_xxs.pt",
-        help="EdgeFace checkpoint filename under edgeface_weights/ (used if --edgeface-weights not given)",
+        help="EdgeFace checkpoint filename under edgeface_weights/ (use edgeface_xxs.pt for initial training)",
     )
     parser.add_argument(
         "--edgeface-weights",
