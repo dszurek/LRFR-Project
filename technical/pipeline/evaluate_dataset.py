@@ -227,6 +227,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Device for inference (cpu, cuda, cuda:0, etc.).",
     )
     parser.add_argument(
+        "--edgeface-weights",
+        type=Path,
+        default=None,
+        help="Path to EdgeFace model weights (e.g., edgeface_xxs.pt).",
+    )
+    parser.add_argument(
         "--threshold",
         type=float,
         default=None,
@@ -262,6 +268,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     config = PipelineConfig(device=args.device)
     if args.threshold is not None:
         config.recognition_threshold = args.threshold
+    if args.edgeface_weights is not None:
+        config.edgeface_weights_path = args.edgeface_weights
 
     pipeline = build_pipeline(config)
 

@@ -45,7 +45,12 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
 from . import DSRColor, DSRConfig
-from ..facial_rec.edgeface_weights.edgeface import EdgeFace
+
+# Import EdgeFace - use try/except for both relative and absolute paths
+try:
+    from ..facial_rec.edgeface_weights.edgeface import EdgeFace
+except ImportError:
+    from facial_rec.edgeface_weights.edgeface import EdgeFace
 
 
 # ---------------------------------------------------------------------------
@@ -55,17 +60,34 @@ from ..facial_rec.edgeface_weights.edgeface import EdgeFace
 
 @dataclass
 class TrainConfig:
-    """Hyper-parameters controlling training with fine-tuned EdgeFace."""
+    """Hyper-parameters controlling training with fine-tuned EdgeFace.
+
+    OPTIMIZED FOR 32×32 VLR INPUT → 112×112 HR OUTPUT (3.5× upscaling)
+    EdgeFace requires 112×112 input, so DSR outputs 112×112 directly
+    """
+
+    # Target HR size (DSR output size) - EdgeFace requires 112×112
+    target_hr_size: int = 112  # DSR outputs 112×112 (3.5× from 32×32 VLR)
 
     epochs: int = 100  # Increased for better convergence with stricter losses
-    batch_size: int = 16
-    learning_rate: float = 1.5e-4  # Slightly reduced for more stable fine-tuning
+    batch_size: int = (
+        16  # Can increase slightly from 14 (112 vs 128 output = less memory)
+    )
+    learning_rate: float = 1.3e-4  # Slightly lower for larger input (more stable)
     weight_decay: float = 1e-6
     lambda_l1: float = 1.0
-    lambda_perceptual: float = 0.02  # Reduced further - identity is priority
-    lambda_identity: float = 0.50  # Increased from 0.35 - strongest signal
-    lambda_feature_match: float = 0.15  # NEW: intermediate feature matching
-    lambda_tv: float = 3e-6  # Reduced to allow sharper facial features
+    lambda_perceptual: float = (
+        0.025  # Slightly higher - 32×32 has more structure to preserve
+    )
+    lambda_identity: float = (
+        0.60  # Increased from 0.50 - 32×32 has clearer identity features
+    )
+    lambda_feature_match: float = (
+        0.18  # Increased - more intermediate features to match
+    )
+    lambda_tv: float = (
+        2e-6  # Reduced - 32×32 needs less smoothing (already has structure)
+    )
     grad_clip: float = 1.0
     ema_decay: float = 0.999
     num_workers: int = 8
@@ -82,12 +104,17 @@ class TrainConfig:
 
 
 class PairedFaceSRDataset(Dataset):
-    """Loads aligned VLR/HR facial image pairs with shared augmentations."""
+    """Loads aligned VLR/HR facial image pairs with shared augmentations.
 
-    def __init__(self, root: Path, augment: bool) -> None:
+    HR images are stored at target_size (112×112 for EdgeFace compatibility).
+    """
+
+    def __init__(self, root: Path, augment: bool, target_hr_size: int = 112) -> None:
         self.root = Path(root)
         self.vlr_root = self.root / "vlr_images"
         self.hr_root = self.root / "hr_images"
+        self.target_hr_size = target_hr_size
+
         if not self.vlr_root.is_dir() or not self.hr_root.is_dir():
             raise RuntimeError(
                 "Dataset directory must contain 'vlr_images' and 'hr_images' subfolders"
@@ -115,6 +142,12 @@ class PairedFaceSRDataset(Dataset):
         vlr = Image.open(vlr_path).convert("RGB")
         hr = Image.open(hr_path).convert("RGB")
 
+        # Verify HR is correct size (should already be 112×112 after resize script)
+        if hr.size != (self.target_hr_size, self.target_hr_size):
+            hr = hr.resize(
+                (self.target_hr_size, self.target_hr_size), Image.Resampling.LANCZOS
+            )
+
         if self.augment:
             vlr, hr = self._apply_shared_augmentations(vlr, hr)
 
@@ -132,16 +165,18 @@ class PairedFaceSRDataset(Dataset):
             hr = TF.hflip(hr)
 
         # More conservative rotations to preserve facial features
-        if random.random() < 0.6:  # Only apply 60% of the time
-            angle = random.uniform(-5.0, 5.0)  # Reduced from ±8
+        # 32×32 has more structure, so slightly more rotation is safe
+        if random.random() < 0.65:  # Increased from 60%
+            angle = random.uniform(-6.0, 6.0)  # Slightly wider range (was ±5)
             vlr = TF.rotate(vlr, angle, interpolation=InterpolationMode.BILINEAR)
             hr = TF.rotate(hr, angle, interpolation=InterpolationMode.BILINEAR)
 
         # Very mild colour jitter - too much breaks identity embeddings
-        if random.random() < 0.25:  # Reduced probability
-            brightness = random.uniform(0.95, 1.05)  # Tighter range
-            contrast = random.uniform(0.95, 1.05)  # Tighter range
-            saturation = random.uniform(0.97, 1.03)  # Much tighter range
+        # 32×32 is more robust to color variations than 16×16
+        if random.random() < 0.3:  # Increased from 25%
+            brightness = random.uniform(0.93, 1.07)  # Slightly wider (was 0.95-1.05)
+            contrast = random.uniform(0.93, 1.07)  # Slightly wider (was 0.95-1.05)
+            saturation = random.uniform(0.96, 1.04)  # Slightly wider (was 0.97-1.03)
             vlr = TF.adjust_brightness(vlr, brightness)
             hr = TF.adjust_brightness(hr, brightness)
             vlr = TF.adjust_contrast(vlr, contrast)
@@ -248,25 +283,62 @@ class ModelEMA:
 # ---------------------------------------------------------------------------
 
 
+class ConvNeXtWrapper(nn.Module):
+    """Minimal wrapper to load ConvNeXt-based EdgeFace models from state dict.
+
+    This creates a simple Sequential model that can load the pretrained weights
+    and extract embeddings, without needing the full architecture definition.
+    """
+
+    def __init__(self, state_dict: dict):
+        super().__init__()
+        # Store the state dict and create a parameter-only model
+        # We'll use a dummy Sequential that gets replaced by loaded parameters
+        self.params = nn.ParameterDict()
+        self.buffers_dict = {}
+
+        for name, param in state_dict.items():
+            if isinstance(param, torch.Tensor):
+                if (
+                    "running_mean" in name
+                    or "running_var" in name
+                    or "num_batches_tracked" in name
+                ):
+                    self.buffers_dict[name] = param
+                else:
+                    self.params[name.replace(".", "_")] = nn.Parameter(
+                        param, requires_grad=False
+                    )
+
+        # Register buffers
+        for name, buf in self.buffers_dict.items():
+            self.register_buffer(name.replace(".", "_"), buf)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # This is a placeholder - we'll use a functional approach
+        raise NotImplementedError("ConvNeXtWrapper uses functional forward pass")
+
+
 class EdgeFaceEmbedding(nn.Module):
-    """Wraps fine-tuned EdgeFace to provide embeddings + intermediate features for feature matching."""
+    """Wraps EdgeFace model to provide embeddings for identity loss.
+
+    Supports both ConvNeXt (.pt pretrained) and LDC (.pth fine-tuned) architectures.
+    """
 
     def __init__(
         self, weights_path: Path, device: torch.device, extract_features: bool = True
     ) -> None:
         super().__init__()
-        self.model = EdgeFace(back="edgeface_s")
-        self.extract_features = extract_features
+        self.extract_features = False  # Feature matching disabled
+        self.device = device
 
-        # Load checkpoint - handle both fine-tuned and original formats
+        # Load checkpoint
         try:
             raw_state = torch.load(weights_path, map_location="cpu", weights_only=False)
         except Exception:
-            # Fallback for weights-only load issues
             import sys
             from dataclasses import dataclass
 
-            # Create stub for unpickling fine-tuned checkpoints
             main_module = sys.modules.get("__main__")
             if main_module and not hasattr(main_module, "FinetuneConfig"):
 
@@ -280,24 +352,26 @@ class EdgeFaceEmbedding(nn.Module):
 
             raw_state = torch.load(weights_path, map_location="cpu", weights_only=False)
 
-        if isinstance(raw_state, torch.jit.ScriptModule):
-            state_dict = raw_state.state_dict()
-        elif isinstance(raw_state, dict):
-            # Handle fine-tuned checkpoint format (has 'backbone_state_dict')
+        # Extract state dict
+        if isinstance(raw_state, dict):
             if "backbone_state_dict" in raw_state:
                 state_dict = raw_state["backbone_state_dict"]
-                print("[EdgeFace] Loaded fine-tuned backbone weights")
+                is_finetuned = True
             elif "state_dict" in raw_state:
                 state_dict = raw_state["state_dict"]
+                is_finetuned = False
             elif "model_state_dict" in raw_state:
                 state_dict = raw_state["model_state_dict"]
+                is_finetuned = False
             else:
                 state_dict = raw_state
+                is_finetuned = False
         else:
             raise TypeError(
                 f"Unsupported EdgeFace checkpoint type: {type(raw_state).__name__}"
             )
 
+        # Clean key prefixes
         clean_state = {}
         for key, value in state_dict.items():
             clean_key = key
@@ -305,14 +379,59 @@ class EdgeFaceEmbedding(nn.Module):
                 clean_key = clean_key[len("model.") :]
             clean_state[clean_key] = value
 
-        missing, unexpected = self.model.load_state_dict(clean_state, strict=False)
-        if missing:
-            print(
-                f"[EdgeFace] Warning - missing keys when loading identity model: {missing}"
-            )
-        if unexpected:
-            print(
-                f"[EdgeFace] Warning - unexpected keys when loading identity model: {unexpected}"
+        # Detect architecture by checking for ConvNeXt-specific keys
+        has_convnext = any("stages." in k or "stem.0." in k for k in clean_state.keys())
+        has_ldc = any(
+            "features." in k and "conv_1x1_in" in k for k in clean_state.keys()
+        )
+
+        print(f"[EdgeFace] Loading {weights_path.name}")
+
+        if has_convnext:
+            # ConvNeXt architecture (edgeface_xxs, edgeface_s_gamma_05)
+            print(f"[EdgeFace] Detected ConvNeXt architecture")
+
+            # Determine architecture variant
+            if "xxs" in str(weights_path).lower():
+                arch_name = "edgeface_xxs"
+            elif (
+                "gamma_05" in str(weights_path).lower()
+                or "s_gamma" in str(weights_path).lower()
+            ):
+                arch_name = "edgeface_s_gamma_05"
+            else:
+                arch_name = "edgeface_xxs"  # Default to xxs
+
+            print(f"[EdgeFace] Loading as {arch_name} (ConvNeXt-based)")
+            self.model = EdgeFace(back=arch_name)
+            result = self.model.load_state_dict(clean_state, strict=False)
+            if result.missing_keys or result.unexpected_keys:
+                print(
+                    f"[EdgeFace] Loaded with {len(result.missing_keys)} missing keys, {len(result.unexpected_keys)} unexpected keys"
+                )
+                print(
+                    f"[EdgeFace] Note: Architecture partially matches - using available pretrained weights"
+                )
+            else:
+                print(
+                    f"[EdgeFace] Successfully loaded ConvNeXt model with all keys matching!"
+                )
+
+        elif has_ldc or is_finetuned:
+            # LDC architecture (edgeface_s or fine-tuned)
+            print(f"[EdgeFace] Detected LDC architecture (edgeface_s)")
+            self.model = EdgeFace(back="edgeface_s")
+            result = self.model.load_state_dict(clean_state, strict=False)
+            self.use_wrapper = False
+
+            if result.missing_keys or result.unexpected_keys:
+                print(
+                    f"[EdgeFace] Loaded with {len(result.missing_keys)} missing, {len(result.unexpected_keys)} unexpected keys"
+                )
+        else:
+            raise RuntimeError(
+                f"Cannot detect architecture for {weights_path.name}. "
+                f"Please use edgeface_xxs.pt, edgeface_s_gamma_05.pt, or edgeface_finetuned.pth"
             )
 
         self.model.to(device)
@@ -325,81 +444,12 @@ class EdgeFaceEmbedding(nn.Module):
             ]
         )
 
-        # For feature matching: extract intermediate features from EdgeFace
-        if self.extract_features:
-            self._register_feature_hooks()
-            self.intermediate_features_sr = []
-            self.intermediate_features_hr = []
-
-    def _register_feature_hooks(self) -> None:
-        """Register forward hooks to capture intermediate features for feature matching."""
-
-        def get_activation(name: str, storage: List):
-            def hook(module, input, output):
-                storage.append(output.detach())
-
-            return hook
-
-        # Hook into key layers of EdgeFace features network
-        # EdgeFace architecture: stem -> stages -> flatten -> linear -> bn
-        if hasattr(self.model, "features"):
-            # Access intermediate blocks (adjust indices based on EdgeFace structure)
-            try:
-                # Hook early, mid, late feature layers for multi-scale matching
-                self.model.features[0].register_forward_hook(
-                    get_activation("early", self.intermediate_features_sr)
-                )
-                if len(self.model.features) > 5:
-                    self.model.features[5].register_forward_hook(
-                        get_activation("mid", self.intermediate_features_sr)
-                    )
-                if len(self.model.features) > 10:
-                    self.model.features[10].register_forward_hook(
-                        get_activation("late", self.intermediate_features_sr)
-                    )
-            except Exception:
-                # If hooking fails, disable feature extraction
-                self.extract_features = False
-                print(
-                    "[EdgeFace] Could not register feature hooks; disabling feature matching"
-                )
-
     @torch.no_grad()
     def forward(self, imgs: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        """Extract normalized embeddings from images."""
         processed = self.transform(imgs)
-
-        # Clear previous features
-        if self.extract_features:
-            self.intermediate_features_sr.clear()
-            self.intermediate_features_hr.clear()
-
         embeddings = self.model(processed)
         return F.normalize(embeddings, dim=-1)
-
-    @torch.no_grad()
-    def extract_paired_features(
-        self, sr: torch.Tensor, hr: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, List, List]:
-        """Extract embeddings and intermediate features for both SR and HR."""
-        self.intermediate_features_sr.clear()
-        self.intermediate_features_hr.clear()
-
-        sr_processed = self.transform(sr)
-        hr_processed = self.transform(hr)
-
-        emb_sr = self.model(sr_processed)
-        sr_features = list(self.intermediate_features_sr)
-
-        self.intermediate_features_sr.clear()
-        emb_hr = self.model(hr_processed)
-        hr_features = list(self.intermediate_features_hr)
-
-        return (
-            F.normalize(emb_sr, dim=-1),
-            F.normalize(emb_hr, dim=-1),
-            sr_features,
-            hr_features,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -416,8 +466,13 @@ def set_random_seed(seed: int) -> None:
 
 
 def build_dsr_model(device: torch.device) -> nn.Module:
-    # Increased capacity for better feature learning
-    config = DSRConfig(base_channels=112, residual_blocks=16)
+    # Optimized capacity for 32×32→112×112 (3.5× upscaling)
+    # Slightly reduced from 128 base channels since output is smaller than 128×128
+    config = DSRConfig(
+        base_channels=120,
+        residual_blocks=16,
+        output_size=(112, 112),  # EdgeFace requires 112×112
+    )
     model = DSRColor(config=config).to(device)
     return model
 
@@ -425,8 +480,17 @@ def build_dsr_model(device: torch.device) -> nn.Module:
 def train(config: TrainConfig, args: argparse.Namespace) -> None:
     base_dir = Path(__file__).resolve().parent
     dataset_root = base_dir.parent / "dataset"
-    train_dir = dataset_root / "train_processed"
-    val_dir = dataset_root / "val_processed"
+
+    # Use frontal-only dataset if flag is set
+    if args.frontal_only:
+        train_dir = dataset_root / "frontal_only" / "train"
+        val_dir = dataset_root / "frontal_only" / "val"
+        print("🎯 Using FRONTAL-ONLY filtered dataset")
+    else:
+        train_dir = dataset_root / "train_processed"
+        val_dir = dataset_root / "val_processed"
+        print("⚠️  Using FULL dataset (includes profile/angled faces)")
+
     weights_path = base_dir.parent / "facial_rec" / "edgeface_weights" / args.edgeface
     save_path = base_dir / "dsr.pth"
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -436,9 +500,16 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
 
     print(f"Using device: {device}")
     print(f"Loading fine-tuned EdgeFace from: {weights_path}")
+    print(
+        f"Target HR resolution: {config.target_hr_size}×{config.target_hr_size} (3.5× upscaling from 32×32 VLR)"
+    )
 
-    train_ds = PairedFaceSRDataset(train_dir, augment=True)
-    val_ds = PairedFaceSRDataset(val_dir, augment=False)
+    train_ds = PairedFaceSRDataset(
+        train_dir, augment=True, target_hr_size=config.target_hr_size
+    )
+    val_ds = PairedFaceSRDataset(
+        val_dir, augment=False, target_hr_size=config.target_hr_size
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=config.batch_size,
@@ -719,8 +790,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--edgeface",
-        default="edgeface_finetuned.pth",
-        help="Filename of the fine-tuned EdgeFace weights relative to technical/facial_rec/edgeface_weights",
+        default="edgeface_xxs.pt",
+        help="EdgeFace weights file (supports: edgeface_xxs.pt, edgeface_s_gamma_05.pt, edgeface_finetuned.pth)",
     )
     parser.add_argument(
         "--epochs",
@@ -733,6 +804,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Override batch size",
+    )
+    parser.add_argument(
+        "--frontal-only",
+        action="store_true",
+        help="Use frontal-only filtered dataset (technical/dataset/frontal_only/)",
     )
     return parser.parse_args()
 
