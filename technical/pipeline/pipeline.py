@@ -159,7 +159,7 @@ class FaceRecognitionPipeline:
 
         self.preprocess = transforms.Compose(
             [
-                transforms.Resize((112, 112)),
+                # No resize needed - DSR outputs 112×112 directly for EdgeFace
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ]
         )
@@ -173,14 +173,83 @@ class FaceRecognitionPipeline:
         except (RuntimeError, ValueError):
             pass
 
-        model = EdgeFace(back="edgeface_s")  # default backbone
+        # Load state dict first to check architecture
         try:
-            # Try safe (weights-only) load first (PyTorch may default to weights_only=True).
-            # If that fails because the file contains pickled objects, retry allowing pickles.
             state_dict = torch.load(resolved, map_location="cpu")
         except Exception as e:
             msg = str(e)
             if (
+                "Weights only load failed" in msg
+                or "UnpicklingError" in msg
+                or "unsupported" in msg
+            ):
+                print(
+                    "[EdgeFace] weights-only load failed; attempting controlled retry with pickles allowed."
+                )
+                import sys
+                import importlib
+
+                try:
+                    finetune_mod = importlib.import_module(
+                        "technical.facial_rec.finetune_edgeface"
+                    )
+                    if hasattr(finetune_mod, "FinetuneConfig"):
+                        main_module = sys.modules.get("__main__")
+                        if main_module and not hasattr(main_module, "FinetuneConfig"):
+                            setattr(
+                                main_module,
+                                "FinetuneConfig",
+                                getattr(finetune_mod, "FinetuneConfig"),
+                            )
+                except Exception as import_err:
+                    print(
+                        f"[EdgeFace] could not import FinetuneConfig ({import_err}); creating stub."
+                    )
+                    try:
+                        from dataclasses import dataclass
+
+                        main_module = sys.modules.get("__main__")
+                        if main_module and not hasattr(main_module, "FinetuneConfig"):
+
+                            @dataclass
+                            class FinetuneConfig:
+                                """Stub for unpickling fine-tuned checkpoint."""
+
+                                pass
+
+                            setattr(main_module, "FinetuneConfig", FinetuneConfig)
+                    except Exception:
+                        pass
+
+                state_dict = torch.load(
+                    resolved, map_location="cpu", weights_only=False
+                )
+            else:
+                raise
+
+        if "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        elif "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
+
+        # Detect architecture from weight keys
+        sample_keys = list(state_dict.keys())[:10]
+        if any("stem" in key or "stages" in key for key in sample_keys):
+            backbone = "edgeface_xxs"  # ConvNeXt architecture
+            print("[EdgeFace] Detected ConvNeXt (edgeface_xxs) architecture")
+        elif any("features" in key for key in sample_keys):
+            backbone = "edgeface_s"  # LDC architecture
+            print("[EdgeFace] Detected LDC (edgeface_s) architecture")
+        else:
+            # Fallback: check filename
+            filename = resolved.stem.lower()
+            if "xxs" in filename:
+                backbone = "edgeface_xxs"
+            else:
+                backbone = "edgeface_s"
+            print(f"[EdgeFace] Using filename-based detection: {backbone}")
+
+        model = EdgeFace(back=backbone)
                 "Weights only load failed" in msg
                 or "UnpicklingError" in msg
                 or "unsupported" in msg
