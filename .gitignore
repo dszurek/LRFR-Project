@@ -1,2 +1,13 @@
 /technical/dataset/*
 /technical/local_packages/*
+
+# LaTeX build
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.synctex.gz
+*.out
+*.toc
+*.bbl
+*.blg
