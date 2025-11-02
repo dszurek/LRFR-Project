@@ -1,20 +1,25 @@
-[project]
-name = "lrfr_project"
+[tool.poetry]
+name = "lrfr-project"
 version = "0.1.0"
 description = "Low Resolution Facial Recognition Research Project for CS 565 - Artificial Intelligence"
-authors = [
-    {name = "Daniel Szurek, Brandon Nguyen"}
-]
+authors = ["Daniel Szurek, Brandon Nguyen"]
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = [
-    "mtcnn (>=1.0.0,<2.0.0)",
-    "tqdm (>=4.67.1,<5.0.0)",
-    "scikit-learn (>=1.7.2,<2.0.0)",
-    "opencv-python (>=4.12.0.88,<5.0.0.0)",
-]
 
+[tool.poetry.dependencies]
+python = ">=3.13, <3.14"
+opencv-python = "*"
+tqdm = "*"
+timm = "*"
+torch = { path = "technical/local_packages/torch-2.8.0+cu129-cp313-cp313-win_amd64.whl"}
+torchvision = { path = "technical/local_packages/torchvision-0.23.0+cu129-cp313-cp313-win_amd64.whl"}
+scikit-image = "^0.25.2"
+scipy = "^1.16.2"
+Pillow = "^10.4.0"
+pytest = "^8.4.2"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
 
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
+requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
