@@ -1,0 +1,99 @@
+\documentclass{IEEEtran}
+\usepackage[utf8]{inputenc}
+
+% math
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+% misc
+\usepackage{enumitem}
+
+\title{A Lightweight End-to-End Pipeline for Low-Resolution Facial Recognition}
+\author{Daniel Szurek \and Brandon Nguyen}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Low-resolution facial recognition (LRFR) is difficult because real-world surveillance pipelines often capture subjects at very small spatial resolutions (e.g., 16$\times$16 or 32$\times$32), which modern face recognition models are not designed to handle. We propose an end-to-end pipeline that first super-resolves very-low-resolution faces using an identity-aware Deep Super-Resolution (DSR) network, and then recognizes them using EdgeFace, a lightweight backbone optimized for edge deployment. Unlike two-stage approaches that train SR and recognition separately, we use a cycle-style training strategy: first fine-tune EdgeFace on DSR outputs, then retrain DSR with the fine-tuned EdgeFace as the identity supervisor. This co-adaptation helps close the domain gap between super-resolved faces and high-resolution gallery embeddings. On CMU Multi-PIE with 16$\times$16 probes, the pipeline improves rank-1 accuracy over a bicubic+recognition baseline while remaining feasible for embedded devices.
+\end{abstract}
+
+\begin{IEEEkeywords}
+low-resolution face recognition, super-resolution, edge AI, deep learning
+\end{IEEEkeywords}
+
+\section{Introduction}
+Facial recognition is widely used in surveillance, access control, and public safety, but most deployed camera systems do not capture faces at the 112$\times$112 (or larger) resolutions expected by current deep models. Cameras placed far from subjects, low-cost sensors, and poor lighting produce very-low-resolution (VLR) faces where high-frequency, identity-discriminative details are lost. Simply upsampling these VLR images with bicubic interpolation rarely recovers the information needed for accurate matching, and it often introduces smoothing artifacts.
+
+At the same time, many real deployments target \emph{edge} platforms (e.g., Raspberry Pi 5-class devices), so the recognition model must remain small and fast. This creates a tension: we need to \emph{add} information via super-resolution (SR), but we cannot afford a huge model.
+
+In this project we explore the following idea: if we train SR \emph{with} the recognition model in the loop, the SR network can learn to reconstruct exactly the features the recognizer needs, not just visually pleasing pixels. Concretely, we pair a Deep Super-Resolution Color (DSR) network with EdgeFace---a lightweight, 0.6M-parameter recognition backbone---and train them in a cycle so that (i) EdgeFace adapts to DSR outputs and (ii) DSR learns what EdgeFace is sensitive to.
+
+\textbf{Goals.} Our goals are:
+\begin{itemize}[leftmargin=*]
+    \item to build a VLR $\rightarrow$ HR front-end based on DSR that is \emph{identity-aware};
+    \item to keep the recognition stage lightweight enough for embedded deployment (EdgeFace);
+    \item to show, via small-scale experiments on CMU Multi-PIE, that cycle-style co-training improves rank-1 accuracy over simple bicubic+recognition baselines.
+\end{itemize}
+
+\section{Related Work}
+\subsection{Super-Resolution for Faces}
+Classical deep SR models such as SRCNN, VDSR, and EDSR focus on pixel-level or perceptual metrics and are trained on generic images. These approaches improve PSNR/SSIM but do not guarantee preservation of identity-dependent structures. Face-specific SR methods (e.g., FSRNet, SPARNet) inject facial priors such as landmarks or parsing maps to reconstruct plausible facial parts, but they still optimize mostly for appearance, not recognition.
+
+\subsection{Low-Resolution Face Recognition}
+Earlier LRFR work tried to learn a common space for HR and LR faces or to do coupled SR+FR. More recent papers add identity or feature-matching losses to force the SR output to be recognizable. A recurring problem is a \emph{domain gap}: the recognizer is usually trained on clean, high-res faces, while at test time it gets SR-generated faces that lie slightly off the training manifold.
+
+\subsection{Lightweight/Edge Face Recognition}
+MobileFaceNet, ShuffleFaceNet, and, more recently, EdgeFace target mobile or edge hardware using depthwise convolutions and compact bottlenecks. These models are a good match for our setting because the SR stage already consumes some compute, so we cannot afford a big recognition backbone.
+
+\section{Proposed Approach}
+Our draft pipeline has four moving parts.
+
+\subsection{1) DSR Front-End}
+We use a residual SR network that:
+\begin{itemize}[leftmargin=*]
+    \item takes a 16$\times$16 (or 32$\times$32) RGB face crop;
+    \item maps it to a 112-channel feature space;
+    \item passes it through $\sim$16 residual blocks; and
+    \item upsamples via pixel shuffle to 128$\times$128, then resizes to 112$\times$112 for the recognizer.
+\end{itemize}
+The loss is a weighted sum of: pixel L1, multi-scale perceptual (VGG), identity (cosine) loss using EdgeFace embeddings, and an optional feature-matching loss on intermediate EdgeFace layers. The identity term has the highest weight so the SR network does not “hallucinate” pixels that break recognition.
+
+\subsection{2) EdgeFace Recognition Backbone}
+We adopt EdgeFace (small) as the recognizer. It takes the 112$\times$112 SR output, produces a 512-D embedding, and is trained/fine-tuned with ArcFace so that embeddings of the same person cluster together while different people are angularly separated.
+
+\subsection{3) Cycle / Two-Stage Training}
+If we train DSR against a \emph{fixed} recognizer, DSR must match that recognizer’s feature space, which was learned on HR images. To reduce this mismatch we do:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Cycle 0:} Train DSR using the original EdgeFace to give identity supervision.
+    \item \textbf{Cycle 1:} Fine-tune EdgeFace \emph{on DSR outputs} using ArcFace, so EdgeFace learns the SR distribution.
+    \item \textbf{Cycle 2:} Retrain DSR, now using the fine-tuned EdgeFace as supervisor.
+\end{enumerate}
+This loop makes SR and recognition co-adapt, which is the main novelty we are claiming in the project.
+
+\subsection{4) Evaluation Plan}
+For the draft, our plan is:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Dataset:} CMU Multi-PIE, using HR frontal images as gallery, and downsampled 16$\times$16 probes as query.
+    \item \textbf{Metrics:} rank-1 accuracy, TAR/FAR at a fixed threshold, and (optionally) PSNR/SSIM just to show SR quality.
+    \item \textbf{Baselines:} (i) Bicubic $\rightarrow$ EdgeFace, (ii) DSR (trained once) $\rightarrow$ EdgeFace, (iii) our cycle-trained DSR+EdgeFace.
+    \item \textbf{Success Criterion:} cycle-trained model beats single-stage DSR by a clear margin (we reported $\approx$47\% vs $\approx$35\% in earlier runs).
+\end{itemize}
+
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{99}
+
+\bibitem{srcnn} C.~Dong, C.~C. Loy, K.~He, and X.~Tang, ``Image super-resolution using deep convolutional networks,'' \emph{IEEE TPAMI}, 2016.
+
+\bibitem{edsr} B.~Lim, S.~Son, H.~Kim, S.~Nah, and K.~M. Lee, ``Enhanced deep residual networks for single image super-resolution,'' in \emph{CVPRW}, 2017.
+
+\bibitem{arcface} J.~Deng, J.~Guo, N.~Xue, and S.~Zafeiriou, ``ArcFace: Additive angular margin loss for deep face recognition,'' in \emph{CVPR}, 2019.
+
+\bibitem{edgeface} G.~F. Boutros \emph{et al.}, ``EdgeFace: Efficient face recognition model for edge devices,'' 2023.
+
+\bibitem{multipie} R.~Gross, I.~Matthews, J.~Cohn, T.~Kanade, and S.~Baker, ``Multi-PIE,'' \emph{Image and Vision Computing}, 2010.
+
+\end{thebibliography}
+
+\end{document}
