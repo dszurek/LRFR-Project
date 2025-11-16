@@ -148,6 +148,7 @@ def summarise_results(
     subject_totals: Counter,
     subject_correct: Counter,
     unknown_predictions: int,
+    gallery_subjects: Optional[set] = None,
 ) -> None:
     total_probes = len(results)
     correct = sum(1 for r in results if r.prediction == r.truth)
@@ -162,12 +163,46 @@ def summarise_results(
             f"({unknown_predictions / total_probes:.2%})"
         )
 
+    # Separate known vs unknown subject performance
+    if gallery_subjects is not None:
+        known_results = [r for r in results if r.truth in gallery_subjects]
+        unknown_results = [r for r in results if r.truth not in gallery_subjects]
+
+        if known_results:
+            known_correct = sum(1 for r in known_results if r.prediction == r.truth)
+            known_accuracy = known_correct / len(known_results)
+            print(f"\nKnown subjects (in gallery):")
+            print(
+                f"  Probes: {len(known_results)}, Correct: {known_correct} ({known_accuracy:.2%})"
+            )
+
+        if unknown_results:
+            unknown_correct = sum(1 for r in unknown_results if r.prediction == r.truth)
+            unknown_accuracy = (
+                unknown_correct / len(unknown_results) if unknown_results else 0.0
+            )
+            unknown_rejected = sum(1 for r in unknown_results if r.prediction is None)
+            print(f"\nUnknown subjects (NOT in gallery):")
+            print(
+                f"  Probes: {len(unknown_results)}, Correct: {unknown_correct} ({unknown_accuracy:.2%})"
+            )
+            print(
+                f"  Correctly rejected as unknown: {unknown_rejected} ({unknown_rejected/len(unknown_results):.2%})"
+            )
+
     print("\n=== Per-subject accuracy (top 10 by probe count) ===")
     ranked = subject_totals.most_common()
     for subject, count in ranked[:10]:
         correct_count = subject_correct.get(subject, 0)
         subject_accuracy = correct_count / count if count else 0.0
-        print(f"{subject:>6} | {correct_count:>3}/{count:<3} | {subject_accuracy:.2%}")
+        in_gallery = (
+            "(in gallery)"
+            if gallery_subjects and subject in gallery_subjects
+            else "(NOT in gallery)"
+        )
+        print(
+            f"{subject:>6} | {correct_count:>3}/{count:<3} | {subject_accuracy:.2%} {in_gallery}"
+        )
 
     misses = [r for r in results if r.prediction not in (None, r.truth)]
     if misses:
@@ -210,16 +245,28 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Directory containing hr_images/ and vlr_images/ subfolders.",
     )
     parser.add_argument(
+        "--gallery-root",
+        type=Path,
+        default=None,
+        help="Root directory for gallery enrollment (e.g., edgeface_finetune/train). Uses HR images from here.",
+    )
+    parser.add_argument(
+        "--probe-root",
+        type=Path,
+        default=None,
+        help="Root directory for test probes (e.g., frontal_only/test). Uses VLR images from here.",
+    )
+    parser.add_argument(
         "--hr-dir",
         type=Path,
         default=None,
-        help="Override the HR gallery directory (defaults to dataset-root/hr_images).",
+        help="Override the HR gallery directory (defaults to dataset-root/hr_images or gallery-root/hr_images).",
     )
     parser.add_argument(
         "--vlr-dir",
         type=Path,
         default=None,
-        help="Override the VLR probe directory (defaults to dataset-root/vlr_images).",
+        help="Override the VLR probe directory (defaults to dataset-root/vlr_images or probe-root/vlr_images).",
     )
     parser.add_argument(
         "--device",
@@ -230,7 +277,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--edgeface-weights",
         type=Path,
         default=None,
-        help="Path to EdgeFace model weights (e.g., edgeface_xxs.pt).",
+        help="Path to EdgeFace model weights (e.g., edgeface_xxs.pt, edgeface_finetuned.pth).",
     )
     parser.add_argument(
         "--threshold",
@@ -255,33 +302,76 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=None,
         help="Optional CSV output path for per-image predictions.",
     )
+    parser.add_argument(
+        "--skip-dsr",
+        action="store_true",
+        help="Bypass the DSR model entirely (feed images directly to EdgeFace).",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
     args = parse_args(argv)
 
-    dataset_root: Path = args.dataset_root
-    hr_dir: Path = args.hr_dir or dataset_root / "hr_images"
-    vlr_dir: Path = args.vlr_dir or dataset_root / "vlr_images"
+    # Determine gallery and probe directories
+    if args.gallery_root and args.probe_root:
+        # Split-dataset mode: enroll from one dataset, test on another
+        gallery_root = args.gallery_root
+        probe_root = args.probe_root
+        hr_dir = args.hr_dir or gallery_root / "hr_images"
+        vlr_dir = args.vlr_dir or probe_root / "vlr_images"
+        print("=" * 70)
+        print("SPLIT-DATASET EVALUATION MODE")
+        print("=" * 70)
+        print(f"Gallery (known identities): {gallery_root}")
+        print(f"Probes (unseen images):     {probe_root}")
+        print()
+    else:
+        # Original mode: same dataset for gallery and probes
+        dataset_root: Path = args.dataset_root
+        hr_dir: Path = args.hr_dir or dataset_root / "hr_images"
+        vlr_dir: Path = args.vlr_dir or dataset_root / "vlr_images"
 
     config = PipelineConfig(device=args.device)
     if args.threshold is not None:
         config.recognition_threshold = args.threshold
     if args.edgeface_weights is not None:
         config.edgeface_weights_path = args.edgeface_weights
+    if args.skip_dsr:
+        config.skip_dsr = True
 
     pipeline = build_pipeline(config)
 
     print("Building gallery from HR images ...")
-    build_gallery(pipeline, hr_dir, use_dsr=args.gallery_via_dsr)
+    gallery_subjects = build_gallery(pipeline, hr_dir, use_dsr=args.gallery_via_dsr)
+    print(f"Enrolled {len(gallery_subjects)} identities in gallery")
 
     print("\nEvaluating VLR probes ...")
     results, subject_totals, subject_correct, unknown_predictions = evaluate_vlr(
         pipeline, vlr_dir, limit=args.limit
     )
 
-    summarise_results(results, subject_totals, subject_correct, unknown_predictions)
+    # Calculate how many test subjects are in the gallery (known vs unknown)
+    test_subjects = set(subject_totals.keys())
+    known_subjects = test_subjects & set(gallery_subjects.keys())
+    unknown_subjects = test_subjects - set(gallery_subjects.keys())
+
+    print(f"\n=== Test Set Composition ===")
+    print(f"Total test subjects:    {len(test_subjects)}")
+    print(
+        f"Known (in gallery):     {len(known_subjects)} ({len(known_subjects)/len(test_subjects):.1%})"
+    )
+    print(
+        f"Unknown (not in gallery): {len(unknown_subjects)} ({len(unknown_subjects)/len(test_subjects):.1%})"
+    )
+
+    summarise_results(
+        results,
+        subject_totals,
+        subject_correct,
+        unknown_predictions,
+        gallery_subjects=set(gallery_subjects.keys()),
+    )
 
     if args.dump_results:
         dump_results_csv(args.dump_results, results)
