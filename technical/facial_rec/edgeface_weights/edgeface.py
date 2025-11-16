@@ -186,7 +186,7 @@ class XCABlock(nn.Module):
     of the channels. The division is: ceil(dim / (num_conv + 1)).
     """
 
-    def __init__(self, dim, num_heads=4, mlp_ratio=4.0, num_conv=1):
+    def __init__(self, dim, num_heads=4, mlp_ratio=4.0, num_conv=1, use_pos_embd=False):
         super().__init__()
         # Calculate channels per conv: use ceiling division
         import math
@@ -206,13 +206,14 @@ class XCABlock(nn.Module):
                 for _ in range(num_conv)
             ]
         )
-        # Positional encoding takes expanded features (dim*4//3) and projects to dim
-        # Expansion happens via interpolation in forward pass
-        expanded_dim = dim * 4 // 3
-        self.expanded_dim = expanded_dim
-        self.pos_embd = PositionalEncoding(
-            expanded_dim, dim
-        )  # Projects expanded_dim → dim
+        # Conditional positional encoding for compatibility with pretrained weights
+        self.use_pos_embd = use_pos_embd
+        if use_pos_embd:
+            expanded_dim = dim * 4 // 3
+            self.expanded_dim = expanded_dim
+            self.pos_embd = PositionalEncoding(
+                expanded_dim, dim
+            )  # Projects expanded_dim → dim
         self.norm_xca = LayerNorm2d(dim)
         self.xca = XCA(dim, num_heads=num_heads)
         self.norm = LayerNorm2d(dim)
@@ -237,22 +238,21 @@ class XCABlock(nn.Module):
             end_idx = min(start_idx + self.conv_channels, C)
             x[:, start_idx:end_idx] = conv(x[:, start_idx:end_idx])
 
-        # Expand channels via interpolation for positional encoding
-        x_expanded = F.interpolate(x, size=(H, W), mode="nearest")
-        # Repeat channels to reach expanded_dim
-        repeat_factor = self.expanded_dim // C
-        remainder = self.expanded_dim % C
-        if repeat_factor > 1:
-            x_expanded = x.repeat(1, repeat_factor, 1, 1)
-            if remainder > 0:
-                x_expanded = torch.cat([x_expanded, x[:, :remainder]], dim=1)
-        elif remainder > 0:
-            x_expanded = torch.cat([x, x[:, :remainder]], dim=1)
-        else:
-            x_expanded = x
-
-        pos = self.pos_embd(x_expanded)
-        x = x + pos
+        # Conditional positional encoding for compatibility with pretrained weights
+        if self.use_pos_embd:
+            x_expanded = F.interpolate(x, size=(H, W), mode="nearest")
+            repeat_factor = self.expanded_dim // C
+            remainder = self.expanded_dim % C
+            if repeat_factor > 1:
+                x_expanded = x.repeat(1, repeat_factor, 1, 1)
+                if remainder > 0:
+                    x_expanded = torch.cat([x_expanded, x[:, :remainder]], dim=1)
+            elif remainder > 0:
+                x_expanded = torch.cat([x, x[:, :remainder]], dim=1)
+            else:
+                x_expanded = x
+            pos = self.pos_embd(x_expanded)
+            x = x + pos
 
         # XCA branch
         xca_out = self.xca(self.norm_xca(x))
@@ -353,8 +353,13 @@ class EdgeFace(nn.Module):
                 for j in range(depths[i]):
                     # Use XCA for last block in stages 1, 2, 3
                     if i > 0 and j == depths[i] - 1:
+                        # Only stage 1, block 1 has positional encoding in pretrained weights
+                        use_pos = i == 1 and j == 1
                         blocks.add_module(
-                            str(j), XCABlock(dims[i], num_heads=4, num_conv=i)
+                            str(j),
+                            XCABlock(
+                                dims[i], num_heads=4, num_conv=i, use_pos_embd=use_pos
+                            ),
                         )
                     else:
                         # Create block with stage-specific kernel size
@@ -409,8 +414,13 @@ class EdgeFace(nn.Module):
                 blocks = nn.Sequential()
                 for j in range(depths[i]):
                     if i > 0 and j == depths[i] - 1:
+                        # Only stage 1, block 1 has positional encoding in pretrained weights
+                        use_pos = i == 1 and j == 1
                         blocks.add_module(
-                            str(j), XCABlock(dims[i], num_heads=8, num_conv=i)
+                            str(j),
+                            XCABlock(
+                                dims[i], num_heads=8, num_conv=i, use_pos_embd=use_pos
+                            ),
                         )
                     else:
                         blocks.add_module(str(j), ConvNeXtBlock(dims[i]))
