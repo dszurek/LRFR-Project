@@ -67,6 +67,7 @@ class PipelineConfig:
     use_tta: bool = (
         False  # Test-time augmentation (flip horizontal) for better embeddings
     )
+    skip_dsr: bool = False  # When True, bypass the DSR network entirely
 
 
 class IdentityDatabase:
@@ -145,9 +146,11 @@ class FaceRecognitionPipeline:
             max_threads = os.cpu_count() or config.num_threads
             torch.set_num_threads(max(1, min(config.num_threads, max_threads)))
 
-        self.dsr_model = dsr_model or load_dsr_model(dsr_path, device=self.device)
-        if config.force_full_precision:
-            self.dsr_model = self.dsr_model.to(dtype=torch.float32)
+        self.dsr_model = None
+        if not config.skip_dsr:
+            self.dsr_model = dsr_model or load_dsr_model(dsr_path, device=self.device)
+            if config.force_full_precision:
+                self.dsr_model = self.dsr_model.to(dtype=torch.float32)
 
         self.recognition_model = recognition_model or self._load_edgeface_model(
             edgeface_path
@@ -165,29 +168,32 @@ class FaceRecognitionPipeline:
         )
 
     def _load_edgeface_model(self, weights_path: Path) -> Any:
+        """Load EdgeFace model - supports TorchScript and fine-tuned checkpoints."""
         resolved = Path(weights_path)
-        try:
-            model = torch.jit.load(resolved, map_location=self.device)
-            model.eval()
-            return model
-        except (RuntimeError, ValueError):
-            pass
 
-        # Load state dict first to check architecture
+        # Try TorchScript first (for edgeface_xxs.pt, edgeface_s_gamma_05.pt, etc.)
         try:
-            state_dict = torch.load(resolved, map_location="cpu")
+            print(f"[EdgeFace] Attempting TorchScript load from {resolved.name}")
+            model = torch.jit.load(str(resolved), map_location=self.device)
+            model.eval()
+            print("[EdgeFace] Successfully loaded TorchScript model")
+            return model
+        except Exception as e:
+            print(f"[EdgeFace] TorchScript load failed: {str(e)[:100]}")
+            print("[EdgeFace] Falling back to architecture loading")
+
+        # Load state dict for fine-tuned checkpoints
+        try:
+            state_dict = torch.load(resolved, map_location="cpu", weights_only=True)
         except Exception as e:
             msg = str(e)
-            if (
-                "Weights only load failed" in msg
-                or "UnpicklingError" in msg
-                or "unsupported" in msg
-            ):
-                print(
-                    "[EdgeFace] weights-only load failed; attempting controlled retry with pickles allowed."
-                )
+            if "Weights only load failed" in msg or "UnpicklingError" in msg:
+                print("[EdgeFace] Attempting load with pickles (fine-tuned checkpoint)")
+
+                # Handle FinetuneConfig pickle dependency
                 import sys
                 import importlib
+                from dataclasses import dataclass
 
                 try:
                     finetune_mod = importlib.import_module(
@@ -201,25 +207,16 @@ class FaceRecognitionPipeline:
                                 "FinetuneConfig",
                                 getattr(finetune_mod, "FinetuneConfig"),
                             )
-                except Exception as import_err:
-                    print(
-                        f"[EdgeFace] could not import FinetuneConfig ({import_err}); creating stub."
-                    )
-                    try:
-                        from dataclasses import dataclass
+                except Exception:
+                    # Create stub if import fails
+                    main_module = sys.modules.get("__main__")
+                    if main_module and not hasattr(main_module, "FinetuneConfig"):
 
-                        main_module = sys.modules.get("__main__")
-                        if main_module and not hasattr(main_module, "FinetuneConfig"):
+                        @dataclass
+                        class FinetuneConfig:
+                            pass
 
-                            @dataclass
-                            class FinetuneConfig:
-                                """Stub for unpickling fine-tuned checkpoint."""
-
-                                pass
-
-                            setattr(main_module, "FinetuneConfig", FinetuneConfig)
-                    except Exception:
-                        pass
+                        setattr(main_module, "FinetuneConfig", FinetuneConfig)
 
                 state_dict = torch.load(
                     resolved, map_location="cpu", weights_only=False
@@ -227,100 +224,53 @@ class FaceRecognitionPipeline:
             else:
                 raise
 
-        if "state_dict" in state_dict:
+        # Extract backbone state dict from checkpoint
+        if "backbone_state_dict" in state_dict:
+            state_dict = state_dict["backbone_state_dict"]
+            print("[EdgeFace] Loaded fine-tuned checkpoint (backbone_state_dict)")
+        elif "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
         elif "model_state_dict" in state_dict:
             state_dict = state_dict["model_state_dict"]
 
-        # Detect architecture from weight keys
+        # Detect architecture from keys
         sample_keys = list(state_dict.keys())[:10]
         if any("stem" in key or "stages" in key for key in sample_keys):
-            backbone = "edgeface_xxs"  # ConvNeXt architecture
+            backbone = "edgeface_xxs"  # ConvNeXt
             print("[EdgeFace] Detected ConvNeXt (edgeface_xxs) architecture")
         elif any("features" in key for key in sample_keys):
-            backbone = "edgeface_s"  # LDC architecture
+            backbone = "edgeface_s"  # LDC
             print("[EdgeFace] Detected LDC (edgeface_s) architecture")
         else:
-            # Fallback: check filename
+            # Fallback to filename
             filename = resolved.stem.lower()
-            if "xxs" in filename:
-                backbone = "edgeface_xxs"
-            else:
-                backbone = "edgeface_s"
-            print(f"[EdgeFace] Using filename-based detection: {backbone}")
+            backbone = "edgeface_xxs" if "xxs" in filename else "edgeface_s"
+            print(f"[EdgeFace] Filename-based detection: {backbone}")
 
-        model = EdgeFace(back=backbone)
-                "Weights only load failed" in msg
-                or "UnpicklingError" in msg
-                or "unsupported" in msg
-            ):
-                print(
-                    "[EdgeFace] weights-only load failed; attempting controlled retry with pickles allowed."
-                )
-                # The checkpoint was saved from __main__ context (finetune script run directly),
-                # so unpickler looks for __main__.FinetuneConfig. We create a stub in __main__
-                # to let unpickler resolve the reference, then retry loading with weights_only=False.
-                import sys
-                import importlib
+        # Create model and load weights
+        model = EdgeFace(embedding_size=512, back=backbone)
 
-                try:
-                    # Import the real FinetuneConfig from finetune module
-                    finetune_mod = importlib.import_module(
-                        "technical.facial_rec.finetune_edgeface"
-                    )
-                    if hasattr(finetune_mod, "FinetuneConfig"):
-                        # Inject into __main__ so unpickler can find __main__.FinetuneConfig
-                        main_module = sys.modules.get("__main__")
-                        if main_module and not hasattr(main_module, "FinetuneConfig"):
-                            setattr(
-                                main_module,
-                                "FinetuneConfig",
-                                getattr(finetune_mod, "FinetuneConfig"),
-                            )
-                except Exception as import_err:
-                    # If import fails, create a minimal stub dataclass in __main__
-                    print(
-                        f"[EdgeFace] could not import FinetuneConfig ({import_err}); creating stub."
-                    )
-                    try:
-                        from dataclasses import dataclass
-
-                        main_module = sys.modules.get("__main__")
-                        if main_module and not hasattr(main_module, "FinetuneConfig"):
-
-                            @dataclass
-                            class FinetuneConfig:
-                                """Stub for unpickling fine-tuned checkpoint."""
-
-                                pass
-
-                            setattr(main_module, "FinetuneConfig", FinetuneConfig)
-                    except Exception:
-                        pass
-
-                # Warning: weights_only=False can execute arbitrary code from the file.
-                state_dict = torch.load(
-                    resolved, map_location="cpu", weights_only=False
-                )
-            else:
-                raise
-        if "state_dict" in state_dict:
-            state_dict = state_dict["state_dict"]
-        elif "model_state_dict" in state_dict:
-            state_dict = state_dict["model_state_dict"]
-
+        # Clean state dict keys
         clean_state_dict: Dict[str, Any] = {}
         for key, value in state_dict.items():
             clean_key = key
             if clean_key.startswith("model."):
                 clean_key = clean_key[len("model.") :]
+            if clean_key.startswith("backbone."):
+                clean_key = clean_key[len("backbone.") :]
             clean_state_dict[clean_key] = value
 
         missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
         if missing:
-            print(f"[EdgeFace] Missing keys: {missing}")
+            print(f"[EdgeFace] Missing keys: {len(missing)}")
+            if len(missing) <= 10:
+                print(f"[EdgeFace]   {missing}")
         if unexpected:
-            print(f"[EdgeFace] Unexpected keys: {unexpected}")
+            print(f"[EdgeFace] Unexpected keys: {len(unexpected)}")
+            if len(unexpected) <= 10:
+                print(f"[EdgeFace]   {unexpected}")
+
+        model.eval()
         return model
 
     # ------------------------------------------------------------------ helpers
@@ -356,6 +306,9 @@ class FaceRecognitionPipeline:
     def upscale(self, image: ImageInput) -> Any:
         _require_torch()
         tensor = self._to_tensor(image)
+        if self.dsr_model is None:
+            # Bypass super-resolution entirely (assume tensor already high-res)
+            return torch.clamp(tensor, 0.0, 1.0)
         with torch.inference_mode():
             output = self.dsr_model(tensor)
         return torch.clamp(output, 0.0, 1.0)

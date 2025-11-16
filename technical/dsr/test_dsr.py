@@ -10,8 +10,9 @@ import numpy as np
 import random
 from typing import Optional
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
+import argparse
 
 # Make project root importable when running the script directly
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,16 +30,12 @@ except Exception:
     from .models import DSRColor, DSRConfig  # type: ignore
 
 # ---------- Config ----------
-MODEL_PATH = (
-    Path(__file__).resolve().parent / "dsr.pth"
-)  # matches technical/dsr/dsr.pth
-# fallback dataset locations (try frontal-only first, then full dataset)
-CANDIDATE_LR_DIRS = [
-    ROOT / "technical" / "dataset" / "frontal_only" / "test" / "vlr_images",
-    ROOT / "technical" / "dataset" / "test_processed" / "vlr_images",
-    ROOT / "technical" / "dataset" / "test_processed" / "clr_images",
-    ROOT / "dataset" / "test_processed" / "vlr_images",
-]
+# DSR model checkpoints for different resolutions
+MODEL_PATHS = {
+    16: Path(__file__).resolve().parent / "dsr16.pth",
+    24: Path(__file__).resolve().parent / "dsr24.pth",
+    32: Path(__file__).resolve().parent / "dsr32.pth",  # Default 32x32 model
+}
 # Try frontal-only HR directory first
 CANDIDATE_HR_DIRS = [
     ROOT / "technical" / "dataset" / "frontal_only" / "test" / "hr_images",
@@ -47,8 +44,24 @@ CANDIDATE_HR_DIRS = [
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def find_lr_dir() -> Optional[Path]:
-    for p in CANDIDATE_LR_DIRS:
+def get_candidate_lr_dirs(vlr_size: int) -> list[Path]:
+    """Generate candidate VLR directories for the given resolution."""
+    vlr_dir_name = f"vlr_images_{vlr_size}x{vlr_size}"
+    candidates = [
+        ROOT / "technical" / "dataset" / "frontal_only" / "test" / vlr_dir_name,
+        ROOT / "technical" / "dataset" / "test_processed" / vlr_dir_name,
+    ]
+    # Legacy fallback for 32x32
+    if vlr_size == 32:
+        candidates.extend([
+            ROOT / "technical" / "dataset" / "frontal_only" / "test" / "vlr_images",
+            ROOT / "technical" / "dataset" / "test_processed" / "vlr_images",
+        ])
+    return candidates
+
+
+def find_lr_dir(vlr_size: int) -> Optional[Path]:
+    for p in get_candidate_lr_dirs(vlr_size):
         if p.exists():
             return p
     return None
@@ -80,7 +93,7 @@ def _infer_dsr_config(state: dict[str, torch.Tensor]) -> DSRConfig:
     return DSRConfig(base_channels=base_channels, residual_blocks=residual_blocks)
 
 
-def robust_load_checkpoint(path: Path, device: torch.device):
+def robust_load_checkpoint(path: Path, device: torch.device, vlr_size: int):
     """Load checkpoint at `path`, build model using inferred config, and load matching params."""
     ckpt = torch.load(path, map_location=device)
 
@@ -141,6 +154,7 @@ def robust_load_checkpoint(path: Path, device: torch.device):
     print(f"[load] matched keys: {len(matched)}, mismatched/ignored: {len(mismatches)}")
     if mismatches:
         print("Sample mismatches (key, ckpt_shape, model_shape):", mismatches[:8])
+    print(f"[load] Model configured for VLR input size: {vlr_size}×{vlr_size}")
     return model
 
 
@@ -191,8 +205,8 @@ def detect_and_crop_face(
     return face_resized
 
 
-def process_user_image(model, img_path: str):
-    """Process user-provided image: detect face, downsample to 32x32, then upscale."""
+def process_user_image(model, img_path: str, vlr_size: int):
+    """Process user-provided image: detect face, downsample to VLR size, then upscale."""
     # Load image
     img_bgr = cv2.imread(img_path)
     if img_bgr is None:
@@ -208,8 +222,8 @@ def process_user_image(model, img_path: str):
         )
         return
 
-    # Downsample to 32x32 (VLR)
-    vlr_face = cv2.resize(hr_face, (32, 32), interpolation=cv2.INTER_AREA)
+    # Downsample to VLR size
+    vlr_face = cv2.resize(hr_face, (vlr_size, vlr_size), interpolation=cv2.INTER_AREA)
     vlr_rgb = cv2.cvtColor(vlr_face, cv2.COLOR_BGR2RGB)
 
     # Run DSR
@@ -227,49 +241,61 @@ def process_user_image(model, img_path: str):
     dsr_height, dsr_width = pred_img_bgr.shape[:2]
     print(f"DSR output size: {dsr_width}×{dsr_height}")
 
-    # Upscale VLR for display (match DSR output size)
-    vlr_display = cv2.resize(
-        vlr_face, (dsr_width, dsr_height), interpolation=cv2.INTER_NEAREST
+    # Scale to uniform size for clean side-by-side display
+    scaled_size = 360
+    scaled_vlr = cv2.resize(
+        vlr_face, (scaled_size, scaled_size), interpolation=cv2.INTER_NEAREST
+    )
+    scaled_dsr = cv2.resize(
+        pred_img_bgr, (scaled_size, scaled_size), interpolation=cv2.INTER_LANCZOS4
+    )
+    scaled_hr = cv2.resize(
+        hr_face, (scaled_size, scaled_size), interpolation=cv2.INTER_LANCZOS4
     )
 
-    # Resize HR face to match DSR output size for comparison
-    hr_face_resized = cv2.resize(
-        hr_face, (dsr_width, dsr_height), interpolation=cv2.INTER_LANCZOS4
-    )
-
-    # Create comparison image (all images should be same size now)
-    comparison_img = np.concatenate(
-        (vlr_display, pred_img_bgr, hr_face_resized), axis=1
-    )
-
-    # Add labels with positions adjusted for 112px width images
+    # Create header with labels
+    header_height = 50
+    header = np.zeros((header_height, scaled_size * 3, 3), dtype=np.uint8)
+    
+    # Add labels to header
+    def add_text_to_header(header, text, x, y, font_scale=0.7, thickness=2):
+        cv2.putText(
+            header,
+            text,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+        )
+    
+    add_text_to_header(header, f"VLR Input ({vlr_size}x{vlr_size})", 50, 35)
+    add_text_to_header(header, f"DSR Output ({dsr_width}x{dsr_height})", 50 + scaled_size, 35)
+    add_text_to_header(header, "Original Face (HR)", 50 + scaled_size * 2, 35)
+    
+    # Stack images horizontally
+    images_row = np.concatenate((scaled_vlr, scaled_dsr, scaled_hr), axis=1)
+    
+    # Add vertical separators between images
+    cv2.line(images_row, (scaled_size, 0), (scaled_size, scaled_size), (100, 100, 100), 2)
+    cv2.line(images_row, (scaled_size * 2, 0), (scaled_size * 2, scaled_size), (100, 100, 100), 2)
+    
+    # Create footer with info
+    footer_height = 30
+    footer = np.zeros((footer_height, scaled_size * 3, 3), dtype=np.uint8)
+    info_text = f"Resolution: {vlr_size}x{vlr_size} -> {dsr_width}x{dsr_height}"
     cv2.putText(
-        comparison_img,
-        "VLR Input (32x32)",
+        footer,
+        info_text,
         (10, 20),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        (255, 255, 255),
+        0.5,
+        (200, 200, 200),
         1,
     )
-    cv2.putText(
-        comparison_img,
-        f"DSR Output ({dsr_width}x{dsr_height})",
-        (dsr_width + 10, 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        (255, 255, 255),
-        1,
-    )
-    cv2.putText(
-        comparison_img,
-        "Original Face (HR)",
-        (dsr_width * 2 + 10, 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        (255, 255, 255),
-        1,
-    )
+    
+    # Combine header, images, and footer
+    comparison_img = np.vstack((header, images_row, footer))
 
     cv2.imshow("Face SR Comparison", comparison_img)
     print("Displaying result. Press any key to close.")
@@ -277,14 +303,15 @@ def process_user_image(model, img_path: str):
     cv2.destroyAllWindows()
 
 
-def process_random_database(model):
+def process_random_database(model, vlr_size: int):
     """Process a random image from the test database (original behavior)."""
-    lr_dir = find_lr_dir()
+    lr_dir = find_lr_dir(vlr_size)
     if lr_dir is None:
+        candidate_dirs = get_candidate_lr_dirs(vlr_size)
         messagebox.showerror(
             "Error",
-            "No LR directory found. Searched:\n"
-            + "\n".join(str(p) for p in CANDIDATE_LR_DIRS),
+            f"No VLR directory found for {vlr_size}×{vlr_size}. Searched:\n"
+            + "\n".join(str(p) for p in candidate_dirs),
         )
         return
 
@@ -332,50 +359,67 @@ def process_random_database(model):
     dsr_height, dsr_width = pred_img_bgr.shape[:2]
     print(f"DSR output size: {dsr_width}×{dsr_height}")
 
-    # Resize VLR for display to match DSR output
-    vlr_display = cv2.resize(
+    # Scale to uniform size for clean side-by-side display
+    scaled_size = 360
+    scaled_vlr = cv2.resize(
         vlr_img_bgr,
-        (dsr_width, dsr_height),
+        (scaled_size, scaled_size),
         interpolation=cv2.INTER_NEAREST,
     )
-
-    # Resize HR to match DSR output size for comparison
-    hr_img_resized = cv2.resize(
+    scaled_dsr = cv2.resize(
+        pred_img_bgr,
+        (scaled_size, scaled_size),
+        interpolation=cv2.INTER_LANCZOS4,
+    )
+    scaled_hr = cv2.resize(
         hr_img_bgr,
-        (dsr_width, dsr_height),
+        (scaled_size, scaled_size),
         interpolation=cv2.INTER_LANCZOS4,
     )
 
-    comparison_img = np.concatenate((vlr_display, pred_img_bgr, hr_img_resized), axis=1)
-
-    # Add labels with dynamic positioning based on actual image widths
+    # Create header with labels
+    header_height = 50
+    header = np.zeros((header_height, scaled_size * 3, 3), dtype=np.uint8)
+    
+    # Add labels to header
+    def add_text_to_header(header, text, x, y, font_scale=0.7, thickness=2):
+        cv2.putText(
+            header,
+            text,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+        )
+    
+    add_text_to_header(header, f"VLR Input ({vlr_size}x{vlr_size})", 50, 35)
+    add_text_to_header(header, f"DSR Output ({dsr_width}x{dsr_height})", 50 + scaled_size, 35)
+    add_text_to_header(header, "Original Face (HR)", 50 + scaled_size * 2, 35)
+    
+    # Stack images horizontally
+    images_row = np.concatenate((scaled_vlr, scaled_dsr, scaled_hr), axis=1)
+    
+    # Add vertical separators between images
+    cv2.line(images_row, (scaled_size, 0), (scaled_size, scaled_size), (100, 100, 100), 2)
+    cv2.line(images_row, (scaled_size * 2, 0), (scaled_size * 2, scaled_size), (100, 100, 100), 2)
+    
+    # Create footer with info
+    footer_height = 30
+    footer = np.zeros((footer_height, scaled_size * 3, 3), dtype=np.uint8)
+    info_text = f"Resolution: {vlr_size}x{vlr_size} -> {dsr_width}x{dsr_height} | Image: {filename}"
     cv2.putText(
-        comparison_img,
-        "VLR Input (32x32)",
+        footer,
+        info_text,
         (10, 20),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        (255, 255, 255),
+        0.5,
+        (200, 200, 200),
         1,
     )
-    cv2.putText(
-        comparison_img,
-        f"DSR Output ({dsr_width}x{dsr_height})",
-        (dsr_width + 10, 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        (255, 255, 255),
-        1,
-    )
-    cv2.putText(
-        comparison_img,
-        "Original Face (HR)",
-        (dsr_width * 2 + 10, 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        (255, 255, 255),
-        1,
-    )
+    
+    # Combine header, images, and footer
+    comparison_img = np.vstack((header, images_row, footer))
 
     cv2.imshow("SR Comparison", comparison_img)
     print("Displaying result. Press any key to close.")
@@ -386,15 +430,15 @@ def process_random_database(model):
 class DSRTestGUI:
     """GUI for testing DSR model with either random database images or user-uploaded images."""
 
-    def __init__(self, root):
+    def __init__(self, root, vlr_size: int = 32):
         self.root = root
         self.root.title("DSR Super-Resolution Tester")
-        self.root.geometry("500x300")
+        self.root.geometry("500x350")
         self.root.resizable(False, False)
 
+        self.vlr_size = vlr_size
         self.model = None
-        self.load_model()
-
+        
         # Title
         title_label = tk.Label(
             root,
@@ -413,9 +457,32 @@ class DSRTestGUI:
         )
         subtitle_label.pack(pady=5)
 
+        # Resolution selection frame
+        resolution_frame = tk.Frame(root)
+        resolution_frame.pack(pady=10)
+        
+        tk.Label(
+            resolution_frame,
+            text="Resolution:",
+            font=("Arial", 11),
+            fg="#2c3e50",
+        ).pack(side=tk.LEFT, padx=5)
+        
+        self.resolution_var = tk.IntVar(value=vlr_size)
+        resolution_combo = ttk.Combobox(
+            resolution_frame,
+            textvariable=self.resolution_var,
+            values=["16", "24", "32"],
+            state="readonly",
+            width=10,
+            font=("Arial", 10),
+        )
+        resolution_combo.pack(side=tk.LEFT, padx=5)
+        resolution_combo.bind("<<ComboboxSelected>>", self.on_resolution_change)
+
         # Button frame
         button_frame = tk.Frame(root)
-        button_frame.pack(pady=30)
+        button_frame.pack(pady=20)
 
         # Random database button
         random_btn = tk.Button(
@@ -453,26 +520,51 @@ class DSRTestGUI:
         self.status_label = tk.Label(root, text="", font=("Arial", 9), fg="#95a5a6")
         self.status_label.pack(pady=10)
 
-        # Model status
-        if self.model is not None:
-            model_status = f"✓ Model loaded from {MODEL_PATH.name}"
-            self.status_label.config(text=model_status, fg="#27ae60")
-        else:
-            self.status_label.config(text="✗ Model not found", fg="#e74c3c")
+        # Load initial model
+        self.load_model()
+
+    def on_resolution_change(self, event=None):
+        """Handle resolution change event."""
+        new_size = self.resolution_var.get()
+        if new_size != self.vlr_size:
+            self.vlr_size = new_size
+            self.status_label.config(
+                text=f"Loading {self.vlr_size}×{self.vlr_size} model...", fg="#3498db"
+            )
+            self.root.update()
+            self.load_model()
 
     def load_model(self):
-        """Load the DSR model."""
+        """Load the DSR model for the current resolution."""
         try:
-            if not MODEL_PATH.exists():
-                messagebox.showerror("Error", f"Model not found at {MODEL_PATH}")
+            model_path = MODEL_PATHS.get(self.vlr_size)
+            if model_path is None or not model_path.exists():
+                available_models = [k for k, v in MODEL_PATHS.items() if v.exists()]
+                messagebox.showerror(
+                    "Error", 
+                    f"Model not found for {self.vlr_size}×{self.vlr_size} at {model_path}\n\n"
+                    f"Available models: {available_models if available_models else 'None'}"
+                )
+                self.status_label.config(
+                    text=f"✗ Model not found for {self.vlr_size}×{self.vlr_size}", 
+                    fg="#e74c3c"
+                )
+                self.model = None
                 return
 
-            print(f"Loading model from {MODEL_PATH}...")
-            self.model = robust_load_checkpoint(MODEL_PATH, DEVICE)
+            print(f"Loading {self.vlr_size}×{self.vlr_size} model from {model_path}...")
+            self.model = robust_load_checkpoint(model_path, DEVICE, self.vlr_size)
             self.model.eval()
             print("Model loaded successfully.")
+            
+            model_status = f"✓ Model loaded: {self.vlr_size}×{self.vlr_size} ({model_path.name})"
+            self.status_label.config(text=model_status, fg="#27ae60")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load model: {str(e)}")
+            self.status_label.config(
+                text=f"✗ Failed to load {self.vlr_size}×{self.vlr_size} model", 
+                fg="#e74c3c"
+            )
             self.model = None
 
     def process_random(self):
@@ -487,7 +579,7 @@ class DSRTestGUI:
         self.root.update()
 
         try:
-            process_random_database(self.model)
+            process_random_database(self.model, self.vlr_size)
             self.status_label.config(text="✓ Processing complete", fg="#27ae60")
         except Exception as e:
             messagebox.showerror("Error", f"Processing failed: {str(e)}")
@@ -515,7 +607,7 @@ class DSRTestGUI:
         self.root.update()
 
         try:
-            process_user_image(self.model, file_path)
+            process_user_image(self.model, file_path, self.vlr_size)
             self.status_label.config(text="✓ Processing complete", fg="#27ae60")
         except Exception as e:
             messagebox.showerror("Error", f"Processing failed: {str(e)}")
@@ -524,8 +616,32 @@ class DSRTestGUI:
 
 def main():
     """Launch the GUI application."""
+    parser = argparse.ArgumentParser(
+        description="Test DSR super-resolution models",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Launch GUI with 32×32 DSR model (default)
+  python -m technical.dsr.test_dsr
+  
+  # Launch GUI with 16×16 DSR model
+  python -m technical.dsr.test_dsr --vlr-size 16
+  
+  # Launch GUI with 24×24 DSR model
+  python -m technical.dsr.test_dsr --vlr-size 24
+        """
+    )
+    parser.add_argument(
+        "--vlr-size",
+        type=int,
+        choices=[16, 24, 32],
+        default=32,
+        help="VLR input resolution (width=height). Default: 32"
+    )
+    args = parser.parse_args()
+    
     root = tk.Tk()
-    app = DSRTestGUI(root)
+    app = DSRTestGUI(root, vlr_size=args.vlr_size)
     root.mainloop()
 
 

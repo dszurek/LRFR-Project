@@ -3,20 +3,24 @@
 The script pairs the preprocessed very-low-resolution (VLR) images with their
 high-resolution (HR) counterparts, applies modern data augmentation and
 perceptual objectives, and optimises an enhanced DSR model that works well with
-the EdgeFace recogniser.
+the EdgeFace recogniser across multiple VLR input resolutions.
 
 Key upgrades compared to the previous baseline:
 
 * Identity-preserving loss now uses the same EdgeFace backbone as the
-  production pipeline and properly aligns checkpoint keys.
+    production pipeline and properly aligns checkpoint keys while remaining frozen
+    during optimisation.
 * Perceptual loss (VGG-19) + total variation regularisation improve texture
-  fidelity without shrugging off facial structure.
+    fidelity without shrugging off facial structure.
 * Exponential Moving Average (EMA) weights, mixed-precision training, and
-  gradient clipping stabilise optimisation.
+    gradient clipping stabilise optimisation.
+* Resolution-aware hyper-parameters and dataset handling support 16×16, 24×24,
+    and 32×32 VLR inputs that all upscale directly to 112×112 for EdgeFace.
 * Rich yet lightweight augmentations (flip/rotation/colour jitter) operate on
-  both HR and VLR inputs with shared randomness to broaden generalisation.
-* The saved checkpoint lands in ``technical/dsr/dsr.pth`` and matches the
-  ``DSRColor`` architecture expected by the inference pipeline.
+    both HR and VLR inputs with shared randomness to broaden generalisation.
+* The saved checkpoint lands in ``technical/dsr/dsr{SIZE}.pth`` (e.g.
+    ``dsr24.pth``) and matches the ``DSRColor`` architecture expected by the
+    inference pipeline.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ import random
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -53,6 +57,17 @@ except ImportError:
     from facial_rec.edgeface_weights.edgeface import EdgeFace
 
 
+def _resolve_vlr_dir_name(vlr_size: int) -> str:
+    """Return the directory name that stores VLR images for a given size.
+    
+    Consistent format for ALL resolutions: vlr_images_{W}x{H}
+    """
+    if vlr_size <= 0:
+        raise ValueError("VLR size must be a positive integer")
+
+    return f"vlr_images_{vlr_size}x{vlr_size}"
+
+
 # ---------------------------------------------------------------------------
 # Configuration containers
 # ---------------------------------------------------------------------------
@@ -68,6 +83,9 @@ class TrainConfig:
 
     # Target HR size (DSR output size) - EdgeFace requires 112×112
     target_hr_size: int = 112  # DSR outputs 112×112 (3.5× from 32×32 VLR)
+    vlr_size: int = 32
+    base_channels: int = 120
+    residual_blocks: int = 16
 
     epochs: int = 100  # Increased for better convergence with stricter losses
     batch_size: int = (
@@ -97,6 +115,42 @@ class TrainConfig:
     early_stop_patience: int = 20  # More patience for slower convergence
     use_multiscale_perceptual: bool = True  # Multi-scale perceptual loss
 
+    @classmethod
+    def make(cls, vlr_size: int) -> "TrainConfig":
+        """Build a resolution-aware configuration for the requested VLR size."""
+
+        cfg = cls(vlr_size=vlr_size)
+
+        if vlr_size <= 16:
+            cfg.epochs = max(cfg.epochs, 120)
+            cfg.batch_size = min(cfg.batch_size, 12)
+            cfg.learning_rate = 1.1e-4
+            cfg.lambda_identity = 0.72
+            cfg.lambda_feature_match = 0.24
+            cfg.lambda_perceptual = 0.030
+            cfg.lambda_tv = 1.6e-6
+            cfg.grad_clip = 0.9
+            cfg.warmup_epochs = max(cfg.warmup_epochs, 6)
+            cfg.base_channels = 132
+            cfg.residual_blocks = 20
+        elif vlr_size <= 24:
+            cfg.epochs = max(cfg.epochs, 110)
+            cfg.batch_size = min(cfg.batch_size, 14)
+            cfg.learning_rate = 1.2e-4
+            cfg.lambda_identity = 0.66
+            cfg.lambda_feature_match = 0.20
+            cfg.lambda_perceptual = 0.028
+            cfg.lambda_tv = 1.8e-6
+            cfg.grad_clip = 0.95
+            cfg.base_channels = 126
+            cfg.residual_blocks = 18
+        else:
+            cfg.vlr_size = 32
+            cfg.base_channels = 120
+            cfg.residual_blocks = 16
+
+        return cfg
+
 
 # ---------------------------------------------------------------------------
 # Dataset with paired augmentations
@@ -104,20 +158,28 @@ class TrainConfig:
 
 
 class PairedFaceSRDataset(Dataset):
-    """Loads aligned VLR/HR facial image pairs with shared augmentations.
+    """Loads aligned VLR/HR facial image pairs with shared augmentations."""
 
-    HR images are stored at target_size (112×112 for EdgeFace compatibility).
-    """
-
-    def __init__(self, root: Path, augment: bool, target_hr_size: int = 112) -> None:
+    def __init__(
+        self,
+        root: Path,
+        augment: bool,
+        vlr_size: int,
+        target_hr_size: int = 112,
+    ) -> None:
         self.root = Path(root)
-        self.vlr_root = self.root / "vlr_images"
+        self.vlr_size = vlr_size
+        self.vlr_root = self.root / _resolve_vlr_dir_name(vlr_size)
         self.hr_root = self.root / "hr_images"
         self.target_hr_size = target_hr_size
 
-        if not self.vlr_root.is_dir() or not self.hr_root.is_dir():
+        if not self.vlr_root.is_dir():
             raise RuntimeError(
-                "Dataset directory must contain 'vlr_images' and 'hr_images' subfolders"
+                f"Missing VLR directory '{self.vlr_root}'. Run regenerate_vlr_dataset with --vlr-sizes {vlr_size}."
+            )
+        if not self.hr_root.is_dir():
+            raise RuntimeError(
+                f"Dataset directory must contain 'hr_images' (expected at {self.hr_root})."
             )
 
         self.pairs: List[Tuple[Path, Path]] = []
@@ -142,6 +204,11 @@ class PairedFaceSRDataset(Dataset):
         vlr = Image.open(vlr_path).convert("RGB")
         hr = Image.open(hr_path).convert("RGB")
 
+        if vlr.size != (self.vlr_size, self.vlr_size):
+            vlr = vlr.resize(
+                (self.vlr_size, self.vlr_size), Image.Resampling.BICUBIC
+            )
+
         # Verify HR is correct size (should already be 112×112 after resize script)
         if hr.size != (self.target_hr_size, self.target_hr_size):
             hr = hr.resize(
@@ -155,9 +222,8 @@ class PairedFaceSRDataset(Dataset):
         hr_tensor = TF.to_tensor(hr)
         return vlr_tensor, hr_tensor
 
-    @staticmethod
     def _apply_shared_augmentations(
-        vlr: Image.Image, hr: Image.Image
+        self, vlr: Image.Image, hr: Image.Image
     ) -> Tuple[Image.Image, Image.Image]:
         # Horizontal flip - safe for face recognition
         if random.random() < 0.5:
@@ -165,18 +231,18 @@ class PairedFaceSRDataset(Dataset):
             hr = TF.hflip(hr)
 
         # More conservative rotations to preserve facial features
-        # 32×32 has more structure, so slightly more rotation is safe
-        if random.random() < 0.65:  # Increased from 60%
-            angle = random.uniform(-6.0, 6.0)  # Slightly wider range (was ±5)
+        rotation_cap = 6.0 if self.vlr_size >= 32 else (5.0 if self.vlr_size >= 24 else 4.0)
+        if random.random() < 0.65:
+            angle = random.uniform(-rotation_cap, rotation_cap)
             vlr = TF.rotate(vlr, angle, interpolation=InterpolationMode.BILINEAR)
             hr = TF.rotate(hr, angle, interpolation=InterpolationMode.BILINEAR)
 
         # Very mild colour jitter - too much breaks identity embeddings
-        # 32×32 is more robust to color variations than 16×16
-        if random.random() < 0.3:  # Increased from 25%
-            brightness = random.uniform(0.93, 1.07)  # Slightly wider (was 0.95-1.05)
-            contrast = random.uniform(0.93, 1.07)  # Slightly wider (was 0.95-1.05)
-            saturation = random.uniform(0.96, 1.04)  # Slightly wider (was 0.97-1.03)
+        jitter_strength = 0.07 if self.vlr_size >= 32 else (0.06 if self.vlr_size >= 24 else 0.05)
+        if random.random() < 0.3:
+            brightness = random.uniform(1 - jitter_strength, 1 + jitter_strength)
+            contrast = random.uniform(1 - jitter_strength, 1 + jitter_strength)
+            saturation = random.uniform(1 - jitter_strength / 2, 1 + jitter_strength / 2)
             vlr = TF.adjust_brightness(vlr, brightness)
             hr = TF.adjust_brightness(hr, brightness)
             vlr = TF.adjust_contrast(vlr, contrast)
@@ -465,21 +531,20 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_dsr_model(device: torch.device) -> nn.Module:
-    # Optimized capacity for 32×32→112×112 (3.5× upscaling)
-    # Slightly reduced from 128 base channels since output is smaller than 128×128
-    config = DSRConfig(
-        base_channels=120,
-        residual_blocks=16,
-        output_size=(112, 112),  # EdgeFace requires 112×112
+def build_dsr_model(config: TrainConfig, device: torch.device) -> nn.Module:
+    dsr_config = DSRConfig(
+        base_channels=config.base_channels,
+        residual_blocks=config.residual_blocks,
+        output_size=(config.target_hr_size, config.target_hr_size),
     )
-    model = DSRColor(config=config).to(device)
+    model = DSRColor(config=dsr_config).to(device)
     return model
 
 
 def train(config: TrainConfig, args: argparse.Namespace) -> None:
     base_dir = Path(__file__).resolve().parent
     dataset_root = base_dir.parent / "dataset"
+    vlr_dir_name = _resolve_vlr_dir_name(config.vlr_size)
 
     # Use frontal-only dataset if flag is set
     if args.frontal_only:
@@ -492,7 +557,8 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
         print("⚠️  Using FULL dataset (includes profile/angled faces)")
 
     weights_path = base_dir.parent / "facial_rec" / "edgeface_weights" / args.edgeface
-    save_path = base_dir / "dsr.pth"
+    save_path = base_dir / f"dsr{config.vlr_size}.pth"
+    legacy_save_path = base_dir / "dsr.pth" if config.vlr_size == 32 else None
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device)
@@ -501,14 +567,21 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
     print(f"Using device: {device}")
     print(f"Loading fine-tuned EdgeFace from: {weights_path}")
     print(
-        f"Target HR resolution: {config.target_hr_size}×{config.target_hr_size} (3.5× upscaling from 32×32 VLR)"
+        f"Target HR resolution: {config.target_hr_size}×{config.target_hr_size} (input VLR {config.vlr_size}×{config.vlr_size})"
     )
+    print(f"Expecting VLR directory: {vlr_dir_name}")
 
     train_ds = PairedFaceSRDataset(
-        train_dir, augment=True, target_hr_size=config.target_hr_size
+        train_dir,
+        augment=True,
+        vlr_size=config.vlr_size,
+        target_hr_size=config.target_hr_size,
     )
     val_ds = PairedFaceSRDataset(
-        val_dir, augment=False, target_hr_size=config.target_hr_size
+        val_dir,
+        augment=False,
+        vlr_size=config.vlr_size,
+        target_hr_size=config.target_hr_size,
     )
     train_loader = DataLoader(
         train_ds,
@@ -525,10 +598,55 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
-    model = build_dsr_model(device)
+    model = build_dsr_model(config, device)
     ema = ModelEMA(model, decay=config.ema_decay)
 
+    # Resume from checkpoint if specified (for cyclic fine-tuning)
+    start_epoch = 0
+    if args.resume:
+        print(f"\n{'='*70}")
+        print(f"[Resume] Loading DSR checkpoint from: {args.resume}")
+        print(f"{'='*70}")
+        try:
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["model_state_dict"])
+                start_epoch = checkpoint.get("epoch", 0) + 1
+                print(f"✅ Loaded model weights from epoch {checkpoint.get('epoch', 'unknown')}")
+                
+                # Format best_psnr safely
+                best_psnr = checkpoint.get('best_psnr', None)
+                if best_psnr is not None:
+                    print(f"   Previous best val PSNR: {best_psnr:.2f} dB")
+                else:
+                    print(f"   Previous best val PSNR: unknown")
+                print(f"   Resuming from epoch {start_epoch}")
+                
+                # Also load EMA state if available
+                if "ema_state_dict" in checkpoint:
+                    try:
+                        ema.ema.load_state_dict(checkpoint["ema_state_dict"])
+                        print(f"✅ Restored EMA weights")
+                    except Exception as e:
+                        print(f"⚠️  Could not load EMA weights: {e}")
+            else:
+                # Assume it's just the model state dict
+                model.load_state_dict(checkpoint)
+                print(f"✅ Loaded model weights (epoch unknown)")
+                print(f"   Starting fresh training from these weights")
+                
+            # Sync EMA with loaded model
+            ema.ema = deepcopy(model)
+            print(f"{'='*70}\n")
+        except Exception as e:
+            print(f"❌ Failed to load checkpoint: {e}")
+            print(f"   Starting training from scratch instead\n")
+            start_epoch = 0
+
     identity_model = EdgeFaceEmbedding(weights_path, device, extract_features=True)
+    identity_model.model.requires_grad_(False)
+    for param in identity_model.parameters():
+        param.requires_grad_(False)
     l1_loss = nn.L1Loss()
     cosine_loss = nn.CosineEmbeddingLoss()
     perceptual_loss = VGGPerceptualLoss(
@@ -557,10 +675,38 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
 
     best_val_psnr = -math.inf
     epochs_without_improvement = 0
+    
+    # Handle --additional-epochs: calculate target epoch based on checkpoint
+    if args.additional_epochs is not None:
+        if not args.resume:
+            raise SystemExit("--additional-epochs requires --resume (need checkpoint to determine starting epoch)")
+        if not isinstance(checkpoint, dict) or 'epoch' not in checkpoint:
+            raise SystemExit("--additional-epochs requires checkpoint with epoch information")
+        
+        target_epoch = start_epoch + args.additional_epochs
+        config.epochs = target_epoch
+        print(f"\n📅 Additional epochs mode:")
+        print(f"   Starting from epoch {start_epoch} (checkpoint epoch {checkpoint.get('epoch', 'unknown')})")
+        print(f"   Training for {args.additional_epochs} additional epochs")
+        print(f"   Target epoch: {target_epoch}\n")
+    
+    # If resuming, load previous best PSNR or score
+    if args.resume and isinstance(checkpoint, dict):
+        prev_best = checkpoint.get('best_score', None)
+            
+        if prev_best is not None:
+            best_val_psnr = prev_best
+            print(f"\n📊 Resuming with baseline score: {best_val_psnr:.4f} (must beat this to save)")
 
     print(f"Training samples: {len(train_ds)}, validation samples: {len(val_ds)}")
     print("Saving best checkpoints to", save_path)
+    if legacy_save_path is not None:
+        print("Legacy compatibility checkpoint will also update", legacy_save_path)
     print(f"\nTraining configuration:")
+    print(f"  - VLR size: {config.vlr_size}×{config.vlr_size}")
+    print(
+        f"  - DSR capacity: base_channels={config.base_channels}, residual_blocks={config.residual_blocks}"
+    )
     print(f"  - Identity loss weight: {config.lambda_identity}")
     print(f"  - Feature matching weight: {config.lambda_feature_match}")
     print(f"  - Perceptual loss weight: {config.lambda_perceptual}")
@@ -568,7 +714,10 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
     print(f"  - Epochs: {config.epochs}, Warmup: {config.warmup_epochs}")
     print(f"  - Early stop patience: {config.early_stop_patience}\n")
 
-    for epoch in range(config.epochs):
+    if start_epoch > 0:
+        print(f"🔄 Resuming training from epoch {start_epoch + 1}\n")
+
+    for epoch in range(start_epoch, config.epochs):
         model.train()
         running_loss = 0.0
         running_psnr = 0.0
@@ -601,8 +750,8 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
                 loss_perc = perceptual_loss(sr, hr)
 
                 # Identity preservation (cosine embedding loss)
-                embeddings_sr = identity_model(sr)
-                embeddings_hr = identity_model(hr)
+                embeddings_sr = identity_model(sr.float())
+                embeddings_hr = identity_model(hr.float())
                 targets = torch.ones(embeddings_sr.size(0), device=device)
                 loss_id = cosine_loss(embeddings_sr, embeddings_hr, targets)
 
@@ -683,8 +832,8 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
 
                     loss_l1 = l1_loss(sr, hr)
                     loss_perc = perceptual_loss(sr, hr)
-                    embeddings_sr = identity_model(sr)
-                    embeddings_hr = identity_model(hr)
+                    embeddings_sr = identity_model(sr.float())
+                    embeddings_hr = identity_model(hr.float())
                     targets = torch.ones(embeddings_sr.size(0), device=device)
                     loss_id = cosine_loss(embeddings_sr, embeddings_hr, targets)
 
@@ -739,29 +888,43 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
                 f"PSNR={val_psnr:.2f}dB"
             )
 
-            if val_psnr > best_val_psnr:
-                best_val_psnr = val_psnr
+            # Use combined metric (PSNR + identity preservation) for all training
+            # Higher PSNR is better (normalize by 40dB max), lower identity loss is better
+            normalized_psnr = min(val_psnr / 40.0, 1.0)
+            normalized_identity = 1.0 - min(val_losses["identity"], 1.0)
+            val_score = 0.6 * normalized_psnr + 0.4 * normalized_identity
+            
+            if val_score > best_val_psnr:
+                best_val_psnr = val_score
                 epochs_without_improvement = 0
                 checkpoint = {
                     "epoch": epoch + 1,
                     "config": asdict(config),
                     "model_state_dict": ema.ema.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "ema_state_dict": ema.ema.state_dict(),
+                    "best_score": val_score,  # Save combined score
+                    "best_psnr": val_psnr,  # Still save actual PSNR for reference
                     "val_psnr": val_psnr,
                     "val_identity_loss": val_losses["identity"],
+                    "vlr_size": config.vlr_size,
                 }
                 torch.save(checkpoint, save_path)
+                if legacy_save_path is not None:
+                    torch.save(checkpoint, legacy_save_path)
                 print(
-                    f"✅ Saved new best checkpoint (val PSNR {val_psnr:.2f}dB, ID loss {val_losses['identity']:.4f})"
+                    f"✅ Saved new best checkpoint (score={val_score:.4f}: PSNR {val_psnr:.2f}dB, ID loss {val_losses['identity']:.4f})"
                 )
             else:
                 epochs_without_improvement += 1
-                if epochs_without_improvement >= config.early_stop_patience:
-                    print(
-                        f"\n⚠️  Early stopping after {epoch + 1} epochs (no improvement for {config.early_stop_patience} epochs)"
-                    )
-                    print(f"Best validation PSNR: {best_val_psnr:.2f}dB")
-                    break
+            
+            
+            if epochs_without_improvement >= config.early_stop_patience:
+                print(
+                    f"\n⚠️  Early stopping after {epoch + 1} epochs (no improvement for {config.early_stop_patience} epochs)"
+                )
+                print(f"Best validation score: {best_val_psnr:.4f}")
+                break
         else:
             print(
                 f"Epoch {epoch + 1:03d} | "
@@ -770,7 +933,19 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
                 f"PSNR={avg_train_psnr:.2f}dB"
             )
 
-    print(f"\n🎉 Training complete! Best validation PSNR: {best_val_psnr:.2f}dB")
+    print(f"\n🎉 Training complete! Best validation score: {best_val_psnr:.4f}")
+    
+    # Show improvement if resuming
+    if args.resume and isinstance(checkpoint, dict):
+        prev_best = checkpoint.get('best_score', None)
+        if prev_best is not None and best_val_psnr > prev_best:
+            improvement = best_val_psnr - prev_best
+            print(f"📈 Improvement: +{improvement:.4f} score ({prev_best:.4f} → {best_val_psnr:.4f})")
+        elif prev_best is not None and best_val_psnr <= prev_best:
+            degradation = prev_best - best_val_psnr
+            print(f"📉 Degraded: -{degradation:.4f} score ({prev_best:.4f} → {best_val_psnr:.4f})")
+            print(f"⚠️  Fine-tuning did not improve the model!")
+    
     print(f"Checkpoint saved to: {save_path}")
 
 
@@ -806,20 +981,81 @@ def parse_args() -> argparse.Namespace:
         help="Override batch size",
     )
     parser.add_argument(
+        "--vlr-size",
+        type=int,
+        default=32,
+        choices=(16, 24, 32),
+        help="Input VLR resolution. Must correspond to regenerated dataset directories (16, 24, or 32).",
+    )
+    parser.add_argument(
         "--frontal-only",
         action="store_true",
         help="Use frontal-only filtered dataset (technical/dataset/frontal_only/)",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to DSR checkpoint to resume training from (for cyclic fine-tuning). "
+             "Example: technical/dsr/dsr32.pth",
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="Override learning rate (useful for cyclic fine-tuning with lower LR)",
+    )
+    parser.add_argument(
+        "--lambda-identity",
+        type=float,
+        default=None,
+        help="Override identity loss weight (useful for cyclic fine-tuning)",
+    )
+    parser.add_argument(
+        "--lambda-feature-match",
+        type=float,
+        default=None,
+        help="Override feature matching loss weight",
+    )
+    parser.add_argument(
+        "--additional-epochs",
+        type=int,
+        default=None,
+        help="Train for N additional epochs from checkpoint (alternative to --epochs). "
+             "Used for cyclic fine-tuning to ensure equal training duration regardless of checkpoint epoch count.",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=None,
+        help="Override early stopping patience (epochs without improvement). "
+             "Default is 15 for initial training. Recommended 8-10 for cyclic fine-tuning.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    train_config = TrainConfig()
+    if args.vlr_size <= 0:
+        raise SystemExit("--vlr-size must be a positive integer")
+
+    train_config = TrainConfig.make(args.vlr_size)
+    
+    # Apply CLI overrides
     if args.epochs is not None:
+        if args.additional_epochs is not None:
+            raise SystemExit("Cannot specify both --epochs and --additional-epochs")
         train_config.epochs = args.epochs
     if args.batch_size is not None:
         train_config.batch_size = args.batch_size
+    if args.learning_rate is not None:
+        train_config.learning_rate = args.learning_rate
+    if args.lambda_identity is not None:
+        train_config.lambda_identity = args.lambda_identity
+    if args.lambda_feature_match is not None:
+        train_config.lambda_feature_match = args.lambda_feature_match
+    if args.patience is not None:
+        train_config.early_stop_patience = args.patience
 
     train(train_config, args)
 

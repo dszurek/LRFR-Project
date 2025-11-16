@@ -1,17 +1,73 @@
 # LRFR Project
 
-End-to-end research prototype for low-resolution facial recognition. The
-repository now contains a reusable pipeline that stitches together the custom
-Deep Super Resolution (DSR) model and the ultra-light EdgeFace `xxs_q` weights
-for identity inference on resource-constrained hardware, such as a Raspberry Pi
-5 (4 GB RAM) running Ubuntu.
+End-to-end research prototype for low-resolution facial recognition with **multi-resolution support**. The
+repository contains a complete pipeline that combines custom Deep Super Resolution (DSR) models
+and ultra-light EdgeFace weights for identity inference, with comprehensive evaluation tools
+suitable for research publications.
+
+## 🎯 New Features
+
+### Multi-Resolution Support (16×16, 24×24, 32×32)
+
+- ✅ **DSR Training:** Train separate models for 16×16, 24×24, and 32×32 VLR inputs
+- ✅ **EdgeFace Fine-Tuning:** Resolution-aware fine-tuning with optimized hyperparameters
+- ✅ **Cyclic Fine-Tuning:** Continue training DSR with fine-tuned EdgeFace for +8-15% accuracy boost
+- ✅ **Comprehensive GUI Evaluation:** Publication-quality metrics and visualizations
+- ✅ **Automated Reporting:** Generate PDF reports with ROC curves, distributions, and comparative analysis
+
+See **`technical/MULTI_RESOLUTION_GUIDE.md`** for complete documentation.
+
+### Cyclic Training (NEW!)
+
+Instead of retraining DSR from scratch, **continue training** with fine-tuned EdgeFace:
+
+```powershell
+# Automated pipeline: Initial DSR → EdgeFace FT → DSR Cyclic FT
+poetry run python -m technical.tools.cyclic_train --device cuda
+
+# Or manual step-by-step (see technical/CYCLIC_TRAINING_QUICKSTART.md)
+```
+
+**Benefits:**
+
+- ⚡ **2-3× faster** than full retraining (50 vs 100 epochs)
+- 📈 **+8-15% accuracy** improvement expected
+- 🎯 **More stable** convergence (preserves learned features)
+
+See **`technical/CYCLIC_TRAINING_QUICKSTART.md`** for quick start guide and **`technical/CYCLIC_VS_RETRAINING_ANALYSIS.md`** for full analysis.
 
 ## 📦 Project layout
 
-- `technical/dsr/` – DSR training scripts and reusable model definitions.
-- `technical/facial_rec/` – EdgeFace backbone utilities and weights.
-- `technical/pipeline/` – Production-focused inference pipeline.
+- `technical/dsr/` – DSR training scripts and model definitions (supports 16×16, 24×24, 32×32).
+- `technical/facial_rec/` – EdgeFace backbone utilities and fine-tuning (resolution-aware).
+- `technical/pipeline/` – Production inference pipeline and evaluation tools.
 - `tests/` – Lightweight unit checks for core utilities.
+
+## 🚀 Quick Start: Multi-Resolution Evaluation
+
+### GUI Mode (Recommended)
+
+```powershell
+# Launch comprehensive evaluation GUI
+poetry run python -m technical.pipeline.evaluate_gui
+```
+
+### Command-Line Mode
+
+```powershell
+# Evaluate all three resolutions
+poetry run python -m technical.pipeline.evaluate_gui `
+    --test-root technical/dataset/frontal_only/test `
+    --gallery-root technical/dataset/frontal_only/train `
+    --resolutions 16 24 32 `
+    --output-dir evaluation_results
+```
+
+**Outputs:**
+
+- `evaluation_report.pdf` - Comprehensive PDF with all visualizations
+- `results.json` - Detailed metrics in JSON format
+- Individual PNG plots (ROC curves, quality metrics, etc.)
 
 ## 🧠 How the DSR model works
 
@@ -106,27 +162,42 @@ methods so that a future CLI can:
 See `technical/pipeline/pipeline.py` for more hooks that can be imported into a
 CLI entry point.
 
-## 📊 Dataset evaluation
+## 📊 Evaluation
 
-Once the dataset has been preprocessed into `*_processed/hr_images` and
-`*_processed/vlr_images` folders, you can benchmark the full pipeline end to end
-with the bundled CLI:
+The project provides comprehensive evaluation tools for both model training and deployment scenarios:
+
+### Quick Dataset Evaluation
 
 ```powershell
 poetry run python -m technical.pipeline.evaluate_dataset `
 	--dataset-root technical/dataset/test_processed
 ```
 
-Key options:
+### Comprehensive Verification & Identification Metrics
 
-- `--device`: select the inference device (`cpu`, `cuda`, etc.).
-- `--threshold`: override the recognition threshold defined in
-  `PipelineConfig`.
-- `--gallery-via-dsr`: run the DSR model over the HR gallery when registering
-  identities (default is to embed HR images directly).
-- `--dump-results`: save a CSV with per-image predictions for further analysis.
+For proper face recognition metrics (FAR, FRR, EER, Rank-1 accuracy):
 
-See `technical/EVALUATION.md` for a more detailed walkthrough.
+```powershell
+# 1:1 Verification (e.g., phone unlock, door access)
+poetry run python -m technical.pipeline.evaluate_verification `
+	--mode verification `
+	--test-root technical/dataset/frontal_only/test
+
+# 1:N Identification (e.g., office with 10 people)
+poetry run python -m technical.pipeline.evaluate_verification `
+	--mode identification `
+	--gallery-root technical/dataset/frontal_only/train `
+	--test-root technical/dataset/frontal_only/test `
+	--max-gallery-size 10
+```
+
+See **`technical/EVALUATION_GUIDE.md`** for:
+
+- Complete evaluation workflows (1:1 verification vs 1:N identification)
+- Metric interpretations (FAR, FRR, EER, Rank-1/5/10 accuracy)
+- Dataset recommendations for different scenarios
+- Training multiple DSR models (16×16, 24×24, 32×32 VLR inputs)
+- EdgeFace fine-tuning for small vs large galleries
 
 ## 🧪 Tests
 
