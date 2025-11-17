@@ -9,8 +9,6 @@ torchvision==0.17.0
 opencv-python-headless==4.9.0.80  # Headless for lower memory footprint
 Pillow==10.2.0
 
-# GUI Framework
-tkmessagebox==2.0.0
 
 # Face Detection (lightweight)
 # Note: We'll use OpenCV's Haar Cascades (built-in, no extra dependency)

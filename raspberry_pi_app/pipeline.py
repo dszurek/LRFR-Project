@@ -33,16 +33,28 @@ import config
 class LRFRPipeline:
     """Complete LRFR pipeline with quantized models for Pi 5."""
     
-    def __init__(self, vlr_size: int = 32, device: str = "cpu"):
+    def __init__(
+        self, 
+        vlr_size: int = 32, 
+        device: str = "cpu",
+        dsr_model_path: Optional[str] = None,
+        edgeface_model_path: Optional[str] = None
+    ):
         """Initialize pipeline with specified VLR resolution.
         
         Args:
             vlr_size: VLR input size (16, 24, or 32)
             device: Device to run on ('cpu' for Pi 5)
+            dsr_model_path: Optional custom path to DSR model (uses default if None)
+            edgeface_model_path: Optional custom path to EdgeFace model (uses default if None)
         """
         self.vlr_size = vlr_size
         self.device = torch.device(device)
         self.hr_size = config.HR_SIZE
+        
+        # Store custom paths
+        self.custom_dsr_path = Path(dsr_model_path) if dsr_model_path else None
+        self.custom_edgeface_path = Path(edgeface_model_path) if edgeface_model_path else None
         
         # Set PyTorch threads for Pi 5
         torch.set_num_threads(config.TORCH_THREADS)
@@ -66,13 +78,17 @@ class LRFRPipeline:
     
     def _load_dsr_model(self) -> DSRColor:
         """Load quantized DSR model."""
-        dsr_path, _ = config.get_model_paths(self.vlr_size)
-        
-        if not dsr_path.exists():
-            raise FileNotFoundError(
-                f"DSR model not found: {dsr_path}\n"
-                f"Run 'git lfs pull' to download quantized models."
-            )
+        # Use custom path if provided, otherwise use default
+        if self.custom_dsr_path and self.custom_dsr_path.exists():
+            dsr_path = self.custom_dsr_path
+            print(f"[DSR] Using custom model: {dsr_path}")
+        else:
+            dsr_path, _ = config.get_model_paths(self.vlr_size)
+            if not dsr_path.exists():
+                raise FileNotFoundError(
+                    f"DSR model not found: {dsr_path}\n"
+                    f"Run 'git lfs pull' to download quantized models."
+                )
         
         print(f"[DSR] Loading from {dsr_path.name}...")
         start = time.time()
@@ -98,13 +114,17 @@ class LRFRPipeline:
     
     def _load_edgeface_model(self) -> EdgeFace:
         """Load quantized EdgeFace model."""
-        _, edgeface_path = config.get_model_paths(self.vlr_size)
-        
-        if not edgeface_path.exists():
-            raise FileNotFoundError(
-                f"EdgeFace model not found: {edgeface_path}\n"
-                f"Run 'git lfs pull' to download quantized models."
-            )
+        # Use custom path if provided, otherwise use default
+        if self.custom_edgeface_path and self.custom_edgeface_path.exists():
+            edgeface_path = self.custom_edgeface_path
+            print(f"[EdgeFace] Using custom model: {edgeface_path}")
+        else:
+            _, edgeface_path = config.get_model_paths(self.vlr_size)
+            if not edgeface_path.exists():
+                raise FileNotFoundError(
+                    f"EdgeFace model not found: {edgeface_path}\n"
+                    f"Run 'git lfs pull' to download quantized models."
+                )
         
         print(f"[EdgeFace] Loading from {edgeface_path.name}...")
         start = time.time()

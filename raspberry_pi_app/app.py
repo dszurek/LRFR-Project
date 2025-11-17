@@ -49,12 +49,25 @@ class LRFRApp:
         self.gallery: Optional[GalleryManager] = None
         self.webcam: Optional[WebcamCapture] = None
         self.current_vlr_size = config.DEFAULT_VLR_SIZE
-        self.verification_mode = tk.StringVar(value="1:N")  # "1:1" or "1:N"
+        self.verification_mode = tk.StringVar(value="1:N")
         self.selected_person = tk.StringVar(value="")
+        
+        # Model paths (defaults from config)
+        self.dsr_model_path = tk.StringVar(value="")
+        self.edgeface_model_path = tk.StringVar(value="")
+        
+        # Pipeline lock to serialize all pipeline access
+        self.pipeline_lock = threading.Lock()
         
         # Processing state
         self.is_processing = False
+        self.is_capturing = False
         self.last_result: Optional[Dict] = None
+        
+        # References to prevent image garbage collection
+        self.input_tk_image: Optional[ImageTk.PhotoImage] = None
+        self.upscaled_tk_image: Optional[ImageTk.PhotoImage] = None
+        self.matched_tk_image: Optional[ImageTk.PhotoImage] = None
         
         # Setup GUI
         self._create_widgets()
@@ -71,7 +84,9 @@ class LRFRApp:
         # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
+        main_frame.columnconfigure(1, weight=3)
+        main_frame.rowconfigure(0, weight=2)
+        main_frame.rowconfigure(1, weight=1)
         main_frame.rowconfigure(2, weight=1)
         
         # ===== Left Panel: Controls =====
@@ -132,17 +147,17 @@ class LRFRApp:
         ttk.Separator(control_frame, orient=tk.HORIZONTAL).grid(row=row, column=0, sticky=(tk.W, tk.E), pady=10)
         row += 1
         
-        # Action buttons
+        # Action buttons - SHORTENED TEXT
         ttk.Button(
             control_frame,
-            text="📷 Capture from Webcam",
+            text="📷 Webcam",
             command=self._on_capture_clicked
         ).grid(row=row, column=0, sticky=(tk.W, tk.E), pady=5)
         row += 1
         
         ttk.Button(
             control_frame,
-            text="📁 Load from File",
+            text="📁 Load File",
             command=self._on_load_file_clicked
         ).grid(row=row, column=0, sticky=(tk.W, tk.E), pady=5)
         row += 1
@@ -152,8 +167,15 @@ class LRFRApp:
         
         ttk.Button(
             control_frame,
-            text="👥 Manage Gallery",
+            text="👥 Gallery",
             command=self._on_manage_gallery_clicked
+        ).grid(row=row, column=0, sticky=(tk.W, tk.E), pady=5)
+        row += 1
+        
+        ttk.Button(
+            control_frame,
+            text="⚙️ Models",
+            command=self._on_model_settings_clicked
         ).grid(row=row, column=0, sticky=(tk.W, tk.E), pady=5)
         row += 1
         
@@ -169,20 +191,38 @@ class LRFRApp:
         
         # ===== Top Right: Image Display =====
         image_frame = ttk.LabelFrame(main_frame, text="Images", padding="10")
-        image_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
+        image_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         
         # Three image panels: Input, Upscaled, Matched
         image_subframe = ttk.Frame(image_frame)
         image_subframe.pack(fill=tk.BOTH, expand=True)
         
+        # Configure column weights to distribute space evenly
+        for i in range(3):
+            image_subframe.columnconfigure(i, weight=1)
+        image_subframe.rowconfigure(0, weight=1)
+        
         for i, title in enumerate(["Input (VLR)", "Upscaled (DSR)", "Matched Identity"]):
             panel = ttk.Frame(image_subframe)
-            panel.grid(row=0, column=i, padx=5, pady=5)
+            panel.grid(row=0, column=i, padx=5, pady=5, sticky=(tk.W, tk.E, tk.N, tk.S))
+            panel.rowconfigure(1, weight=1)
+            panel.columnconfigure(0, weight=1)
             
-            ttk.Label(panel, text=title, font=('TkDefaultFont', 10, 'bold')).pack()
+            ttk.Label(panel, text=title, font=('TkDefaultFont', 10, 'bold')).grid(row=0, column=0, sticky=tk.W)
             
-            label = ttk.Label(panel, text="No image", relief=tk.SUNKEN, width=25, height=15)
-            label.pack(padx=5, pady=5)
+            # Use tk.Label with proper configuration
+            label = tk.Label(
+                panel,
+                text="No image",
+                relief=tk.SUNKEN,
+                bg="gray90",
+                compound=tk.CENTER,
+                anchor=tk.CENTER
+            )
+            label.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(5, 0))
+            
+            # Set minimum size for the label
+            label.configure(width=150, height=150)
             
             if i == 0:
                 self.input_image_label = label
@@ -193,10 +233,10 @@ class LRFRApp:
         
         # ===== Middle Right: Results =====
         results_frame = ttk.LabelFrame(main_frame, text="Top-5 Predictions", padding="10")
-        results_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(10, 0))
+        results_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         
         # Results text area
-        self.results_text = tk.Text(results_frame, height=8, width=60, wrap=tk.WORD)
+        self.results_text = tk.Text(results_frame, height=6, width=60, wrap=tk.WORD)
         results_scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.results_text.yview)
         self.results_text.configure(yscrollcommand=results_scrollbar.set)
         
@@ -211,9 +251,9 @@ class LRFRApp:
         
         # ===== Bottom Right: Performance Metrics =====
         metrics_frame = ttk.LabelFrame(main_frame, text="Performance Metrics", padding="10")
-        metrics_frame.grid(row=2, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(10, 0))
+        metrics_frame.grid(row=2, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        self.metrics_text = tk.Text(metrics_frame, height=6, width=60, wrap=tk.WORD)
+        self.metrics_text = tk.Text(metrics_frame, height=4, width=60, wrap=tk.WORD)
         self.metrics_text.pack(fill=tk.BOTH, expand=True)
         self.metrics_text.tag_configure("metric", font=('TkDefaultFont', 9))
     
@@ -227,18 +267,27 @@ class LRFRApp:
                 # Initialize gallery
                 self.gallery = GalleryManager()
                 
-                # Initialize pipeline with default resolution
-                self.pipeline = LRFRPipeline(vlr_size=self.current_vlr_size)
-                
-                # Compute embeddings if gallery exists
-                if self.gallery.size() > 0:
-                    self.gallery.compute_all_embeddings(self.pipeline)
+                # Use the lock during initialization
+                with self.pipeline_lock:
+                    # Initialize pipeline with default resolution
+                    dsr_path = self.dsr_model_path.get() if self.dsr_model_path.get() else None
+                    edgeface_path = self.edgeface_model_path.get() if self.edgeface_model_path.get() else None
+                    
+                    self.pipeline = LRFRPipeline(
+                        vlr_size=self.current_vlr_size,
+                        dsr_model_path=dsr_path,
+                        edgeface_model_path=edgeface_path
+                    )
+                    
+                    # Compute embeddings if gallery exists
+                    if self.gallery.size() > 0:
+                        self.gallery.compute_all_embeddings(self.pipeline)
                 
                 # Update UI
                 self.root.after(0, self._on_initialization_complete)
                 
             except Exception as e:
-                self.root.after(0, lambda: self._on_initialization_error(str(e)))
+                self.root.after(0, lambda err=str(e): self._on_initialization_error(err))
         
         threading.Thread(target=init_thread, daemon=True).start()
     
@@ -301,17 +350,26 @@ class LRFRApp:
                 del old_pipeline
                 gc.collect()
                 
-                # Load new pipeline
-                self.pipeline = LRFRPipeline(vlr_size=self.current_vlr_size)
+                # Use the lock during reload
+                with self.pipeline_lock:
+                    # Load new pipeline
+                    dsr_path = self.dsr_model_path.get() if self.dsr_model_path.get() else None
+                    edgeface_path = self.edgeface_model_path.get() if self.edgeface_model_path.get() else None
+                    
+                    self.pipeline = LRFRPipeline(
+                        vlr_size=self.current_vlr_size,
+                        dsr_model_path=dsr_path,
+                        edgeface_model_path=edgeface_path
+                    )
+                    
+                    # Recompute embeddings
+                    if self.gallery.size() > 0:
+                        self.gallery.compute_all_embeddings(self.pipeline)
                 
-                # Recompute embeddings
-                if self.gallery.size() > 0:
-                    self.gallery.compute_all_embeddings(self.pipeline)
-                
-                self.root.after(0, lambda: self._on_reload_complete())
+                self.root.after(0, self._on_reload_complete)
                 
             except Exception as e:
-                self.root.after(0, lambda: self._on_reload_error(str(e)))
+                self.root.after(0, lambda err=str(e): self._on_reload_error(err))
         
         threading.Thread(target=reload_thread, daemon=True).start()
     
@@ -340,44 +398,73 @@ class LRFRApp:
             self.person_select_label.grid_remove()
             self.person_select_combo.grid_remove()
     
+    def _on_model_settings_clicked(self):
+        """Open model settings dialog."""
+        ModelSettingsDialog(self.root, self.dsr_model_path, self.edgeface_model_path, self._reload_pipeline)
+    
     def _on_capture_clicked(self):
         """Handle webcam capture button click."""
         if self.is_processing:
             messagebox.showwarning("Busy", "Processing in progress, please wait...")
             return
         
-        if self.gallery.size() == 0:
-            messagebox.showwarning("No Gallery", "Please add people to gallery first.")
+        if self.is_capturing:
+            messagebox.showwarning("Busy", "Webcam capture already in progress...")
             return
         
-        # Open webcam and capture
-        self._capture_from_webcam()
+        # Gallery check for 1:N mode
+        if self.verification_mode.get() == "1:N" and self.gallery.size() == 0:
+            messagebox.showwarning("No Gallery", "Please add people to gallery first for 1:N identification.")
+            return
+        
+        # Open webcam and capture - RUN ON MAIN THREAD
+        self._capture_from_webcam_main_thread()
     
-    def _capture_from_webcam(self):
-        """Capture face from webcam."""
+    def _capture_from_webcam_main_thread(self):
+        """Capture face from webcam - runs entirely on main thread."""
+        if self.is_capturing:
+            return
+        
+        self.is_capturing = True
         self._set_status("Opening webcam...", "blue")
         
-        try:
-            webcam = WebcamCapture()
-            if not webcam.open():
-                raise RuntimeError("Failed to open webcam")
+        # Create webcam
+        self.webcam = WebcamCapture()
+        if not self.webcam.open():
+            self.is_capturing = False
+            self._set_status("Failed to open webcam", "red")
+            messagebox.showerror("Webcam Error", "Failed to open webcam")
+            return
+        
+        self._set_status("Position yourself and press SPACE to capture", "blue")
+        
+        # Start polling for frames using Tkinter's after method
+        self._webcam_poll()
+    
+    def _webcam_poll(self):
+        """Poll webcam for frames - called repeatedly by Tkinter."""
+        if not self.is_capturing or self.webcam is None:
+            return
+        
+        # Read and display frame
+        face = self.webcam.poll_for_capture()
+        
+        if face is not None:
+            # Capture successful or cancelled
+            self.webcam.close()
+            self.webcam = None
+            self.is_capturing = False
             
-            self._set_status("Position yourself and press SPACE to capture", "blue")
-            
-            # Capture face
-            face = webcam.capture_face(output_size=config.HR_SIZE)
-            webcam.close()
-            
-            if face is None:
+            if isinstance(face, np.ndarray):
+                # Got a face image
+                self._set_status("Face captured!", "green")
+                self._process_face(face.copy())
+            else:
+                # Cancelled
                 self._set_status("Capture cancelled", "orange")
-                return
-            
-            # Process captured face
-            self._process_face(face)
-            
-        except Exception as e:
-            self._set_status(f"Webcam error: {str(e)}", "red")
-            messagebox.showerror("Webcam Error", f"Failed to capture from webcam:\n{str(e)}")
+        else:
+            # Continue polling
+            self.root.after(10, self._webcam_poll)
     
     def _on_load_file_clicked(self):
         """Handle load from file button click."""
@@ -385,8 +472,8 @@ class LRFRApp:
             messagebox.showwarning("Busy", "Processing in progress, please wait...")
             return
         
-        if self.gallery.size() == 0:
-            messagebox.showwarning("No Gallery", "Please add people to gallery first.")
+        if self.verification_mode.get() == "1:N" and self.gallery.size() == 0:
+            messagebox.showwarning("No Gallery", "Please add people to gallery first for 1:N identification.")
             return
         
         # Open file dialog
@@ -432,51 +519,55 @@ class LRFRApp:
         
         def process_thread():
             try:
-                # Run pipeline
-                result = self.pipeline.process_image(face_image, return_intermediate=True)
-                
-                # Get gallery embeddings
-                gallery_embeddings, gallery_names = self.gallery.get_gallery_embeddings()
-                
-                if not gallery_embeddings:
-                    raise ValueError("No embeddings in gallery")
-                
-                # Perform identification
-                mode = self.verification_mode.get()
-                
-                if mode == "1:1":
-                    # Verify against selected person
-                    selected = self.selected_person.get()
-                    if not selected:
-                        raise ValueError("No person selected for 1:1 verification")
+                # Use the lock during processing
+                with self.pipeline_lock:
+                    # Run pipeline
+                    result = self.pipeline.process_image(face_image, return_intermediate=True)
                     
-                    person_idx = gallery_names.index(selected)
-                    is_match, similarity = self.pipeline.verify_1_to_1(
-                        result["embedding"],
-                        gallery_embeddings[person_idx]
-                    )
+                    # Get gallery embeddings
+                    gallery_embeddings, gallery_names = self.gallery.get_gallery_embeddings()
                     
-                    result["mode"] = "1:1"
-                    result["target_person"] = selected
-                    result["is_match"] = is_match
-                    result["similarity"] = similarity
-                    result["predictions"] = [(selected, similarity, is_match)]
+                    # Perform identification
+                    mode = self.verification_mode.get()
                     
-                else:  # 1:N
-                    predictions = self.pipeline.identify_1_to_n(
-                        result["embedding"],
-                        gallery_embeddings,
-                        gallery_names
-                    )
-                    
-                    result["mode"] = "1:N"
-                    result["predictions"] = predictions
+                    if mode == "1:1":
+                        # Verify against selected person
+                        selected = self.selected_person.get()
+                        if not selected:
+                            raise ValueError("No person selected for 1:1 verification")
+                        if not gallery_embeddings:
+                             raise ValueError("Gallery is empty, cannot verify")
+                        
+                        person_idx = gallery_names.index(selected)
+                        is_match, similarity = self.pipeline.verify_1_to_1(
+                            result["embedding"],
+                            gallery_embeddings[person_idx]
+                        )
+                        
+                        result["mode"] = "1:1"
+                        result["target_person"] = selected
+                        result["is_match"] = is_match
+                        result["similarity"] = similarity
+                        result["predictions"] = [(selected, similarity, is_match)]
+                        
+                    else:  # 1:N
+                        if not gallery_embeddings:
+                            raise ValueError("No embeddings in gallery, cannot identify")
+                        
+                        predictions = self.pipeline.identify_1_to_n(
+                            result["embedding"],
+                            gallery_embeddings,
+                            gallery_names
+                        )
+                        
+                        result["mode"] = "1:N"
+                        result["predictions"] = predictions
                 
                 # Update UI
-                self.root.after(0, lambda: self._on_processing_complete(result))
+                self.root.after(0, lambda res=result: self._on_processing_complete(res))
                 
             except Exception as e:
-                self.root.after(0, lambda: self._on_processing_error(str(e)))
+                self.root.after(0, lambda err=str(e): self._on_processing_error(err))
         
         threading.Thread(target=process_thread, daemon=True).start()
     
@@ -508,26 +599,57 @@ class LRFRApp:
         """Update image display panels."""
         # Input (VLR)
         if "vlr_image" in result:
-            self._display_image(result["vlr_image"], self.input_image_label)
+            self._display_image(result["vlr_image"], "input")
+        else:
+            self._display_image(None, "input")
         
         # Upscaled (DSR output)
         if "sr_image" in result:
-            self._display_image(result["sr_image"], self.upscaled_image_label)
+            self._display_image(result["sr_image"], "upscaled")
+        else:
+            self._display_image(None, "upscaled")
         
         # Matched identity (rank-1 prediction)
+        thumbnail = None
         if "predictions" in result and len(result["predictions"]) > 0:
             top_match_name = result["predictions"][0][0]
-            thumbnail = self.gallery.get_person_thumbnail(top_match_name)
-            if thumbnail is not None:
-                self._display_image(thumbnail, self.matched_image_label)
-    
-    def _display_image(self, cv_image: np.ndarray, label: ttk.Label):
+            # Check if match is valid before showing thumbnail
+            if result["predictions"][0][2]:
+                thumbnail = self.gallery.get_person_thumbnail(top_match_name)
+            
+        if thumbnail is not None:
+            self._display_image(thumbnail, "matched")
+        else:
+            self._display_image(None, "matched")
+
+    def _display_image(self, cv_image: Optional[np.ndarray], image_type: str):
         """Convert OpenCV image to Tkinter and display."""
+        
+        label = None
+        if image_type == "input":
+            label = self.input_image_label
+        elif image_type == "upscaled":
+            label = self.upscaled_image_label
+        elif image_type == "matched":
+            label = self.matched_image_label
+        
+        if cv_image is None:
+            # Clear the image
+            label.configure(image='', text="No image")
+            if image_type == "input":
+                self.input_tk_image = None
+            elif image_type == "upscaled":
+                self.upscaled_tk_image = None
+            elif image_type == "matched":
+                self.matched_tk_image = None
+            return
+
         # Convert BGR to RGB
         rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
         
         # Resize to fit display
-        rgb = cv2.resize(rgb, config.RESULT_IMAGE_SIZE, interpolation=cv2.INTER_AREA)
+        display_size = (200, 200)
+        rgb = cv2.resize(rgb, display_size, interpolation=cv2.INTER_AREA)
         
         # Convert to PIL Image
         pil_image = Image.fromarray(rgb)
@@ -537,11 +659,14 @@ class LRFRApp:
         
         # Update label
         label.configure(image=tk_image, text="")
-        label.image = tk_image  # Keep reference to prevent garbage collection
         
-        # Clean up intermediate objects
-        del pil_image
-        del rgb
+        # Keep reference on self to prevent garbage collection
+        if image_type == "input":
+            self.input_tk_image = tk_image
+        elif image_type == "upscaled":
+            self.upscaled_tk_image = tk_image
+        elif image_type == "matched":
+            self.matched_tk_image = tk_image
     
     def _update_results_display(self, result: Dict):
         """Update results text area with predictions."""
@@ -570,6 +695,11 @@ class LRFRApp:
         else:
             # 1:N Identification
             self.results_text.insert(tk.END, "1:N Identification Results\n", "header")
+            
+            if not predictions:
+                self.results_text.insert(tk.END, "\nNo one in gallery to identify.", "nomatch")
+                return
+
             self.results_text.insert(tk.END, f"\nTop-{len(predictions)} Matches:\n\n")
             
             for rank, (name, similarity, is_valid) in enumerate(predictions, 1):
@@ -592,28 +722,115 @@ class LRFRApp:
         self.metrics_text.insert(tk.END, "Processing Time Breakdown:\n\n", "metric")
         
         # Per-stage timings
-        for stage, time_ms in timings.items():
-            self.metrics_text.insert(tk.END, f"  {stage.capitalize()}: {time_ms:.1f} ms\n", "metric")
-        
-        self.metrics_text.insert(tk.END, f"\nTotal Time: {total_time:.1f} ms\n", "metric")
-        self.metrics_text.insert(tk.END, f"Throughput: {1000/total_time:.1f} FPS\n\n", "metric")
-        
+        if timings:
+            for stage, time_ms in timings.items():
+                self.metrics_text.insert(tk.END, f"  {stage.capitalize()}: {time_ms:.1f} ms\n", "metric")
+            
+            self.metrics_text.insert(tk.END, f"\nTotal Time: {total_time:.1f} ms\n", "metric")
+            if total_time > 0:
+                self.metrics_text.insert(tk.END, f"Throughput: {1000/total_time:.1f} FPS\n\n", "metric")
+        else:
+             self.metrics_text.insert(tk.END, "  No timing data available.\n", "metric")
+
         # Model info
         self.metrics_text.insert(tk.END, f"Resolution: {self.current_vlr_size}×{self.current_vlr_size} → 112×112\n", "metric")
-        self.metrics_text.insert(tk.END, f"Gallery Size: {self.gallery.size()} people\n", "metric")
+        if self.gallery:
+            self.metrics_text.insert(tk.END, f"Gallery Size: {self.gallery.size()} people\n", "metric")
     
     def _on_manage_gallery_clicked(self):
         """Open gallery management dialog."""
-        GalleryDialog(self.root, self.gallery, self.pipeline, self._update_person_list)
+        GalleryDialog(self.root, self.gallery, self.pipeline, self.pipeline_lock, self._update_person_list)
+
+
+class ModelSettingsDialog:
+    """Dialog for configuring model paths."""
+    
+    def __init__(self, parent, dsr_path_var: tk.StringVar, edgeface_path_var: tk.StringVar, callback):
+        """Initialize model settings dialog."""
+        self.dsr_path_var = dsr_path_var
+        self.edgeface_path_var = edgeface_path_var
+        self.callback = callback
+        
+        # Create dialog window
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Model Settings")
+        self.dialog.geometry("600x300")
+        
+        self._create_widgets()
+    
+    def _create_widgets(self):
+        """Create dialog widgets."""
+        main_frame = ttk.Frame(self.dialog, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # DSR Model Path
+        ttk.Label(main_frame, text="DSR Model Path:", font=('TkDefaultFont', 10, 'bold')).pack(anchor=tk.W, pady=(0, 5))
+        
+        dsr_frame = ttk.Frame(main_frame)
+        dsr_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.dsr_entry = ttk.Entry(dsr_frame, textvariable=self.dsr_path_var, width=50)
+        self.dsr_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        ttk.Button(dsr_frame, text="Browse...", command=self._browse_dsr).pack(side=tk.LEFT)
+        ttk.Button(dsr_frame, text="Clear", command=lambda: self.dsr_path_var.set("")).pack(side=tk.LEFT, padx=(5, 0))
+        
+        ttk.Label(main_frame, text="(Leave empty to use default)", font=('TkDefaultFont', 8, 'italic')).pack(anchor=tk.W, pady=(0, 15))
+        
+        # EdgeFace Model Path
+        ttk.Label(main_frame, text="EdgeFace Model Path:", font=('TkDefaultFont', 10, 'bold')).pack(anchor=tk.W, pady=(0, 5))
+        
+        edgeface_frame = ttk.Frame(main_frame)
+        edgeface_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.edgeface_entry = ttk.Entry(edgeface_frame, textvariable=self.edgeface_path_var, width=50)
+        self.edgeface_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        ttk.Button(edgeface_frame, text="Browse...", command=self._browse_edgeface).pack(side=tk.LEFT)
+        ttk.Button(edgeface_frame, text="Clear", command=lambda: self.edgeface_path_var.set("")).pack(side=tk.LEFT, padx=(5, 0))
+        
+        ttk.Label(main_frame, text="(Leave empty to use default)", font=('TkDefaultFont', 8, 'italic')).pack(anchor=tk.W, pady=(0, 20))
+        
+        # Action buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        ttk.Button(button_frame, text="Apply & Reload", command=self._on_apply).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Close", command=self.dialog.destroy).pack(side=tk.RIGHT, padx=5)
+    
+    def _browse_dsr(self):
+        """Browse for DSR model file."""
+        filename = filedialog.askopenfilename(
+            title="Select DSR Model",
+            filetypes=[("PyTorch Model", "*.pth *.pt"), ("All files", "*.*")]
+        )
+        if filename:
+            self.dsr_path_var.set(filename)
+    
+    def _browse_edgeface(self):
+        """Browse for EdgeFace model file."""
+        filename = filedialog.askopenfilename(
+            title="Select EdgeFace Model",
+            filetypes=[("PyTorch Model", "*.pth *.pt"), ("All files", "*.*")]
+        )
+        if filename:
+            self.edgeface_path_var.set(filename)
+    
+    def _on_apply(self):
+        """Apply settings and reload pipeline."""
+        if messagebox.askyesno("Confirm", "This will reload the models with the new paths.\nContinue?"):
+            self.dialog.destroy()
+            self.callback()
 
 
 class GalleryDialog:
     """Dialog for managing gallery."""
     
-    def __init__(self, parent, gallery: GalleryManager, pipeline: LRFRPipeline, callback):
+    def __init__(self, parent, gallery: GalleryManager, pipeline: LRFRPipeline, pipeline_lock: threading.Lock, callback):
         """Initialize gallery management dialog."""
         self.gallery = gallery
         self.pipeline = pipeline
+        self.pipeline_lock = pipeline_lock
         self.callback = callback
         
         # Create dialog window
@@ -671,7 +888,7 @@ class GalleryDialog:
             messagebox.showwarning("Gallery Full", f"Gallery is full ({config.MAX_GALLERY_SIZE} people max)")
             return
         
-        AddPersonDialog(self.dialog, self.gallery, self.pipeline, self._refresh_list)
+        AddPersonDialog(self.dialog, self.gallery, self.pipeline, self.pipeline_lock, self._refresh_list)
     
     def _on_remove_person(self):
         """Remove selected person."""
@@ -685,7 +902,7 @@ class GalleryDialog:
         if messagebox.askyesno("Confirm", f"Remove '{name}' from gallery?"):
             self.gallery.remove_person(name)
             self._refresh_list()
-            self.callback()  # Update main window
+            self.callback()
     
     def _on_clear_all(self):
         """Clear entire gallery."""
@@ -701,12 +918,15 @@ class GalleryDialog:
 class AddPersonDialog:
     """Dialog for adding a person to gallery."""
     
-    def __init__(self, parent, gallery: GalleryManager, pipeline: LRFRPipeline, callback):
+    def __init__(self, parent, gallery: GalleryManager, pipeline: LRFRPipeline, pipeline_lock: threading.Lock, callback):
         """Initialize add person dialog."""
         self.gallery = gallery
         self.pipeline = pipeline
+        self.pipeline_lock = pipeline_lock
         self.callback = callback
         self.images = []
+        self.is_capturing = False
+        self.webcam = None
         
         # Create dialog
         self.dialog = tk.Toplevel(parent)
@@ -752,20 +972,43 @@ class AddPersonDialog:
             messagebox.showwarning("Limit Reached", f"Maximum {config.MAX_IMAGES_PER_PERSON} images per person")
             return
         
-        try:
-            webcam = WebcamCapture()
-            if not webcam.open():
-                raise RuntimeError("Failed to open webcam")
-            
-            face = webcam.capture_face(output_size=config.HR_SIZE)
-            webcam.close()
-            
-            if face is not None:
-                self.images.append(face)
-                self._update_images_label()
+        if self.is_capturing:
+            messagebox.showwarning("Busy", "Webcam capture in progress...")
+            return
         
-        except Exception as e:
-            messagebox.showerror("Webcam Error", f"Failed to capture:\n{str(e)}")
+        self.is_capturing = True
+        
+        # Create webcam
+        self.webcam = WebcamCapture()
+        if not self.webcam.open():
+            self.is_capturing = False
+            messagebox.showerror("Webcam Error", "Failed to open webcam")
+            return
+        
+        # Start polling
+        self._webcam_poll()
+    
+    def _webcam_poll(self):
+        """Poll webcam for frames."""
+        if not self.is_capturing or self.webcam is None:
+            return
+        
+        # Read and display frame
+        face = self.webcam.poll_for_capture()
+        
+        if face is not None:
+            # Capture successful or cancelled
+            self.webcam.close()
+            self.webcam = None
+            self.is_capturing = False
+            
+            if isinstance(face, np.ndarray):
+                # Got a face image
+                self.images.append(face.copy())
+                self.dialog.after(0, self._update_images_label)
+        else:
+            # Continue polling
+            self.dialog.after(10, self._webcam_poll)
     
     def _load_image(self):
         """Load image from file."""
@@ -817,14 +1060,20 @@ class AddPersonDialog:
             return
         
         # Add to gallery
-        success = self.gallery.add_person(name, self.images, pipeline=self.pipeline, overwrite=False)
-        
+        success = False
+        try:
+            with self.pipeline_lock:
+                success = self.gallery.add_person(name, self.images, pipeline=self.pipeline, overwrite=False)
+        except Exception as e:
+            messagebox.showerror("Gallery Error", f"Failed to add person:\n{str(e)}")
+            return
+
         if success:
             messagebox.showinfo("Success", f"Added '{name}' to gallery")
-            self.callback()  # Refresh parent
+            self.callback()
             self.dialog.destroy()
         else:
-            messagebox.showerror("Error", "Failed to add person to gallery")
+            messagebox.showerror("Error", "Failed to add person to gallery (may already exist)")
 
 
 def main():

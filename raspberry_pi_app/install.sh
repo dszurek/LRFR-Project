@@ -1,8 +1,8 @@
 #!/bin/bash
 # Installation script for Raspberry Pi 5 LRFR Application
-# Run this on your Raspberry Pi 5 with Ubuntu 24.04
+# UPDATED for Ubuntu 24.04
 
-set -e  # Exit on error
+set -e # Exit on error
 
 echo "======================================================================"
 echo "Raspberry Pi 5 LRFR Application - Installation Script"
@@ -12,7 +12,7 @@ echo ""
 # Check if running on ARM64
 ARCH=$(uname -m)
 if [ "$ARCH" != "aarch64" ]; then
-    echo "⚠️  Warning: Not running on ARM64 (detected: $ARCH)"
+    echo "⚠️ Warning: Not running on ARM64 (detected: $ARCH)"
     echo "This script is designed for Raspberry Pi 5"
     read -p "Continue anyway? (y/N) " -n 1 -r
     echo
@@ -28,25 +28,25 @@ sudo apt-get upgrade -y
 
 # Install system dependencies
 echo ""
-echo "Installing system dependencies..."
+echo "Installing system dependencies for Ubuntu 24.04..."
 sudo apt-get install -y \
-    python3.11 \
+    python3.12-dev \
     python3-pip \
-    python3-venv \
+    python3.12-venv \
     python3-tk \
     git-lfs \
     v4l-utils \
     libopencv-dev \
-    python3-opencv \
     libatlas-base-dev \
     libhdf5-dev \
-    libharfbuzz0b \
-    libwebp7 \
-    libjasper1 \
-    libgstreamer1.0-0 \
-    libavcodec58 \
-    libavformat58 \
-    libswscale5
+    libharfbuzz-dev \
+    libwebp-dev \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    libgtk-3-dev
 
 # Initialize Git LFS
 echo ""
@@ -55,8 +55,8 @@ git lfs install
 
 # Create virtual environment
 echo ""
-echo "Creating Python virtual environment..."
-python3 -m venv venv
+echo "Creating Python 3.12 virtual environment..."
+python3.12 -m venv venv
 
 # Activate venv
 source venv/bin/activate
