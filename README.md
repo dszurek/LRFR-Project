@@ -62,7 +62,7 @@ End-to-end research prototype for low-resolution facial recognition with **multi
 Production-ready GUI application for real-time facial recognition on edge devices:
 
 - **Gallery Management:** Create custom galleries (up to 5 people) with your own images
-- **Real-time Webcam Capture:** Automatic face detection and cropping  
+- **Real-time Webcam Capture:** Automatic face detection and cropping
 - **Multi-Resolution Support:** Test with 16×16, 24×24, or 32×32 VLR inputs
 - **Dual Operation Modes:** 1:1 Verification or 1:N Identification
 - **Live Performance Metrics:** Top-5 predictions, confidence scores, processing time breakdown
@@ -97,6 +97,7 @@ poetry run python -m technical.tools.cyclic_train --device cuda
 ```
 
 **Benefits:**
+
 - ⚡ **2-3× faster** than full retraining (50 vs 100 epochs)
 - 📈 **+8-15% accuracy** improvement over single-stage training
 - 🎯 **More stable** convergence (preserves learned features)
@@ -165,6 +166,7 @@ poetry run python -m technical.pipeline.evaluate_dataset \
 ```
 
 **Evaluation Outputs:**
+
 - `evaluation_report.pdf` - Comprehensive PDF with all visualizations
 - `results.json` - Detailed metrics in JSON format
 - Individual PNG plots (ROC curves, CMC curves, score distributions, etc.)
@@ -185,6 +187,7 @@ The DSR network upscales very-low-resolution (VLR) face images to high-resolutio
 4. **Total Variation Regularization:** Reduces checkerboard artifacts
 
 **Training Details:**
+
 - Optimizer: AdamW with cosine learning-rate decay
 - Mixed Precision: AMP for faster training
 - EMA (Exponential Moving Average): Stable validation weights
@@ -200,6 +203,7 @@ The end-to-end pipeline (`technical/pipeline/pipeline.py`) orchestrates:
 4. **Decide:** Select gallery identity with highest similarity (if above threshold)
 
 **Configuration:**
+
 - Device selection (CPU/GPU)
 - Thread count for CPU inference
 - Similarity thresholds for verification/identification
@@ -210,18 +214,21 @@ The end-to-end pipeline (`technical/pipeline/pipeline.py`) orchestrates:
 ## 📊 Evaluation Metrics
 
 ### 1:1 Verification Metrics
+
 - **FAR (False Accept Rate):** Impostor incorrectly accepted
 - **FRR (False Reject Rate):** Genuine user incorrectly rejected
 - **EER (Equal Error Rate):** Operating point where FAR = FRR
 - **TAR@FAR:** True Accept Rate at specific False Accept Rate
 
 ### 1:N Identification Metrics
+
 - **Rank-1 Accuracy:** Correct identity is top match
 - **Rank-5/10 Accuracy:** Correct identity in top-5/10 matches
 - **CMC (Cumulative Match Characteristic) Curve:** Rank-k accuracy vs rank
 - **d-prime (d'):** Separability between genuine and impostor distributions
 
 ### Visualization Outputs
+
 - ROC Curves (TAR vs FAR)
 - DET Curves (FRR vs FAR)
 - CMC Curves (Identification Rate vs Rank)
@@ -246,6 +253,7 @@ poetry run python -m technical.tools.quantize_models --models all --export-onnx
 ```
 
 **Quantization Results:**
+
 - **EdgeFace:** 4.75MB → 0.49MB (89.6% reduction)
 - **DSR Models:** ~30-40MB → ~30-40MB (minimal reduction due to Conv2d layers)
 - **RAM Usage:** ~271MB (FP32) → ~83MB (INT8) = 69% reduction
@@ -262,6 +270,7 @@ poetry run pytest
 ```
 
 Test coverage includes:
+
 - Identity database operations
 - Pipeline consistency
 - Model loading and inference
@@ -302,6 +311,7 @@ poetry run python -m technical.dataset.preprocess \
 ### Custom Training Configuration
 
 Modify training parameters in scripts:
+
 - **DSR:** `technical/dsr/train_dsr.py` - Adjust epochs, batch size, learning rate
 - **EdgeFace:** `technical/facial_rec/finetune_edgeface.py` - Configure fine-tuning hyperparameters
 - **Cyclic:** `technical/tools/cyclic_train.py` - Set cyclic training iterations
@@ -339,15 +349,16 @@ result["sr_image"].save("upscaled_probe.png")
 If you use this work, please cite:
 
 ```bibtex
-@misc{lrfr2024,
+@misc{lrfr2025,
   title={Low-Resolution Facial Recognition via Deep Super-Resolution and Cyclic Training},
-  author={[Your Names]},
-  year={2024},
+  author={Daniel Szurek, Brandon Nguyen},
+  year={2025},
   note={CS565 Course Project}
 }
 ```
 
 ### Related Files
+
 - **Proposal:** `Proposal/` - Initial project proposal
 - **Paper:** `Submission Paper/` - LaTeX source for research paper
 - **Presentation:** `presentation/` - Final presentation slides
@@ -360,12 +371,14 @@ If you use this work, please cite:
 ### Common Issues
 
 **1. CUDA Out of Memory**
+
 ```powershell
 # Reduce batch size in training scripts
 # Use gradient accumulation instead
 ```
 
 **2. Model Loading Errors**
+
 ```powershell
 # Check model paths in config files
 # Ensure quantized models are downloaded via Git LFS
@@ -373,6 +386,7 @@ git lfs pull
 ```
 
 **3. Raspberry Pi Installation Issues**
+
 ```powershell
 # Install system dependencies first
 sudo apt-get update
@@ -383,6 +397,7 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 ```
 
 **4. Import Errors**
+
 ```powershell
 # Ensure technical module is in path
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
@@ -402,7 +417,7 @@ This project is for academic research purposes. See individual model licenses fo
 ## 🙏 Acknowledgments
 
 - **EdgeFace:** Ultra-lightweight face recognition backbone
-- **VGGFace2 Dataset:** Training and evaluation data
+- **CMU PIE & Labeled Faces in the Wild Datasets:** Training and evaluation data
 - **PyTorch:** Deep learning framework
 - **OpenCV:** Computer vision utilities
 
@@ -411,9 +426,10 @@ This project is for academic research purposes. See individual model licenses fo
 ## 📧 Contact
 
 For questions or collaboration:
+
 - Open an issue on GitHub
 - Contact: [Your Email/Department]
 
 ---
 
-**Last Updated:** November 2024
+**Last Updated:** November 2025
