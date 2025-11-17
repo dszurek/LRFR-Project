@@ -5,6 +5,28 @@ repository contains a complete pipeline that combines custom Deep Super Resoluti
 and ultra-light EdgeFace weights for identity inference, with comprehensive evaluation tools
 suitable for research publications.
 
+## 🎉 NEW: Raspberry Pi 5 Deployment App
+
+Production-ready GUI application for real-time facial recognition on Raspberry Pi 5:
+
+- **Gallery Management:** Create custom galleries (1-5 people) with your own images
+- **Real-time Webcam Capture:** Automatic face detection and cropping
+- **Multi-Resolution Support:** Test with 16×16, 24×24, or 32×32 VLR inputs
+- **1:1 Verification** or **1:N Identification** modes
+- **Live Performance Metrics:** Top-5 predictions, confidence scores, processing time
+- **Memory Optimized:** Uses quantized INT8 models (89% smaller)
+
+**See `raspberry_pi_app/README.md` for complete documentation.**
+
+Quick start on Raspberry Pi 5 (Ubuntu 24.04):
+
+```bash
+cd raspberry_pi_app
+bash install.sh           # Install dependencies and models
+source venv/bin/activate
+python app.py             # Launch GUI application
+```
+
 ## 🎯 New Features
 
 ### Multi-Resolution Support (16×16, 24×24, 32×32)
