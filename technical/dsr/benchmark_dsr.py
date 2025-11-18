@@ -101,7 +101,7 @@ def calculate_entropy(img):
 # ============================================================
 def benchmark():
     # --- Config ---
-    MODEL_PATH = "dsr/dsr.pth"
+    MODEL_PATH = "dsr/dsr32.pth"
     TEST_DATA_DIR = "dataset/test_processed"
     BATCH_SIZE = 16
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

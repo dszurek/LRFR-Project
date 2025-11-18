@@ -40,7 +40,7 @@ class ContrastiveConfig:
     # Paths
     dataset_root: Path = Path("technical/dataset/edgeface_finetune/train")
     val_dataset_root: Path = Path("technical/dataset/edgeface_finetune/val")
-    dsr_weights: Path = Path("technical/dsr/dsr.pth")
+    dsr_weights: Path = Path("technical/dsr/dsr32.pth")
     edgeface_pretrained: Path = Path(
         "technical/facial_rec/edgeface_weights/edgeface_xxs.pt"
     )

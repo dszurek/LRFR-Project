@@ -43,6 +43,11 @@ class WebcamCapture:
         self.fps_start_time = time.time()
         self.fps_frame_count = 0
         self.current_fps = 0.0
+        
+        # For polling mode
+        self.window_name = "Webcam Capture - Press SPACE to capture, ESC to cancel"
+        self.last_face_rect = None
+        self.captured_face = None
     
     def open(self) -> bool:
         """Open camera and configure settings.
@@ -50,15 +55,28 @@ class WebcamCapture:
         Returns:
             True if camera opened successfully
         """
-        if self.is_opened:
-            print("[Webcam] Already opened")
-            return True
+        # Force close if already opened
+        if self.is_opened or self.cap is not None:
+            print("[Webcam] Forcing close before reopen...")
+            self.close()
+            time.sleep(0.3)
         
         print(f"[Webcam] Opening camera {self.camera_index}...")
         
-        self.cap = cv2.VideoCapture(self.camera_index)
+        # Try multiple times
+        for attempt in range(3):
+            self.cap = cv2.VideoCapture(self.camera_index)
+            
+            if self.cap.isOpened():
+                break
+            
+            print(f"[Webcam] Attempt {attempt + 1} failed, retrying...")
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
+            time.sleep(0.3)
         
-        if not self.cap.isOpened():
+        if self.cap is None or not self.cap.isOpened():
             print(f"[Webcam] Failed to open camera {self.camera_index}")
             return False
         
@@ -66,8 +84,9 @@ class WebcamCapture:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
-        # Try to set MJPEG format for better performance (if supported)
+        # Try to set MJPEG format
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         
         # Get actual settings
@@ -77,7 +96,7 @@ class WebcamCapture:
         
         print(f"[Webcam] Opened: {actual_width}×{actual_height} @ {actual_fps} FPS")
         
-        # Warmup camera (skip first frames for auto-exposure)
+        # Warmup camera
         for _ in range(config.WEBCAM_WARMUP_FRAMES):
             self.cap.read()
         
@@ -85,33 +104,55 @@ class WebcamCapture:
         self.fps_start_time = time.time()
         self.fps_frame_count = 0
         
+        # Create window for polling mode
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.window_name, 640, 480)
+        
         return True
     
     def close(self):
-        """Release camera."""
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
+        """Release camera and destroy windows."""
+        print("[Webcam] Closing...")
         
         self.is_opened = False
+        
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception as e:
+                print(f"[Webcam] Error releasing camera: {e}")
+            finally:
+                self.cap = None
+        
+        try:
+            cv2.destroyWindow(self.window_name)
+            cv2.waitKey(1)
+        except Exception as e:
+            print(f"[Webcam] Error destroying window: {e}")
+        
         print("[Webcam] Closed")
     
-    def read_frame(self) -> Optional[np.ndarray]:
-        """Read single frame from camera.
+    def poll_for_capture(self) -> Optional[np.ndarray]:
+        """Poll for a single frame and handle user input.
+        
+        Called repeatedly by GUI's event loop.
         
         Returns:
-            Frame (H, W, 3) BGR or None if failed
+            None if still waiting for capture
+            np.ndarray if face captured
+            False if cancelled
         """
-        if not self.is_opened:
-            return None
+        if not self.is_opened or self.cap is None:
+            return False
         
+        # Read frame
         ret, frame = self.cap.read()
         
         if not ret or frame is None:
             print("[Webcam] Failed to read frame")
-            return None
+            return False
         
-        # Update FPS counter
+        # Update FPS
         self.fps_frame_count += 1
         elapsed = time.time() - self.fps_start_time
         if elapsed >= 1.0:
@@ -119,149 +160,111 @@ class WebcamCapture:
             self.fps_frame_count = 0
             self.fps_start_time = time.time()
         
-        return frame
-    
-    def read_with_face_detection(
-        self,
-        draw_boxes: bool = True,
-        show_fps: bool = None
-    ) -> Tuple[Optional[np.ndarray], list]:
-        """Read frame and detect faces.
+        # Detect faces (every 3 frames)
+        if self.fps_frame_count % 3 == 0:
+            faces = self.face_detector.detect_faces(frame)
+            if faces:
+                self.last_face_rect = faces[0]
         
-        Args:
-            draw_boxes: Draw bounding boxes on frame
-            show_fps: Show FPS counter (default from config)
+        # Create display frame
+        display_frame = frame.copy()
         
-        Returns:
-            (frame, faces) where faces is list of (x, y, w, h) bounding boxes
-        """
-        if show_fps is None:
-            show_fps = config.SHOW_FPS
-        
-        frame = self.read_frame()
-        
-        if frame is None:
-            return None, []
-        
-        # Detect faces
-        faces = self.face_detector.detect_faces(frame)
-        
-        # Draw visualization
-        if draw_boxes and len(faces) > 0:
-            frame = self.face_detector.draw_detections(frame, faces)
-        
-        # Draw FPS
-        if show_fps:
-            fps_text = f"FPS: {self.current_fps:.1f}"
+        # Draw face rectangle
+        if self.last_face_rect is not None:
+            x, y, w, h = self.last_face_rect
+            
+            cv2.rectangle(
+                display_frame,
+                (x, y),
+                (x + w, y + h),
+                config.COLOR_GREEN,
+                2
+            )
+            
             cv2.putText(
-                frame,
-                fps_text,
-                (10, 30),
+                display_frame,
+                "Face detected - Ready to capture!",
+                (10, 60),
                 config.FONT_FACE,
                 config.FONT_SCALE,
                 config.COLOR_GREEN,
                 config.FONT_THICKNESS
             )
+        else:
+            cv2.putText(
+                display_frame,
+                "No face detected - position yourself in frame",
+                (10, 60),
+                config.FONT_FACE,
+                config.FONT_SCALE,
+                config.COLOR_RED,
+                config.FONT_THICKNESS
+            )
         
-        return frame, faces
-    
-    def capture_face(
-        self,
-        output_size: Tuple[int, int] = None,
-        max_attempts: int = 30,
-        show_preview: bool = True,
-        window_name: str = "Capture Face - Press SPACE"
-    ) -> Optional[np.ndarray]:
-        """Interactive face capture with live preview.
+        # Add FPS
+        fps_text = f"FPS: {self.current_fps:.1f}"
+        cv2.putText(
+            display_frame,
+            fps_text,
+            (10, 30),
+            config.FONT_FACE,
+            config.FONT_SCALE,
+            config.COLOR_GREEN,
+            config.FONT_THICKNESS
+        )
         
-        Args:
-            output_size: Resize captured face to (w, h)
-            max_attempts: Maximum frames to try before giving up
-            show_preview: Show live camera preview
-            window_name: Window name for preview
+        # Add instructions
+        cv2.putText(
+            display_frame,
+            "SPACE: Capture | ESC: Cancel",
+            (10, display_frame.shape[0] - 20),
+            config.FONT_FACE,
+            config.FONT_SCALE,
+            config.COLOR_YELLOW,
+            config.FONT_THICKNESS
+        )
         
-        Returns:
-            Cropped face image or None if failed
-        """
-        if not self.is_opened and not self.open():
-            return None
+        # Show frame
+        cv2.imshow(self.window_name, display_frame)
         
-        if show_preview:
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        # Check for key press (non-blocking)
+        key = cv2.waitKey(1) & 0xFF
         
-        captured_face = None
-        attempts = 0
+        if key == 27:  # ESC
+            print("[Webcam] Capture cancelled by user")
+            return False
         
-        print("[Webcam] Press SPACE to capture, ESC to cancel...")
-        
-        while attempts < max_attempts:
-            frame, faces = self.read_with_face_detection()
+        elif key == ord(' ') or key == 32:  # SPACE
+            if self.last_face_rect is None:
+                print("[Webcam] No face detected, try again")
+                return None  # Continue polling
             
-            if frame is None:
-                break
+            # Crop face
+            captured_face = self.face_detector.detect_and_crop(
+                frame,
+                output_size=config.HR_SIZE
+            )
             
-            attempts += 1
-            
-            # Show preview
-            if show_preview:
-                # Add instructions
-                instructions = "SPACE: Capture | ESC: Cancel"
-                cv2.putText(
-                    frame,
-                    instructions,
-                    (10, frame.shape[0] - 10),
-                    config.FONT_FACE,
-                    config.FONT_SCALE,
-                    config.COLOR_YELLOW,
-                    config.FONT_THICKNESS
+            if captured_face is not None:
+                print("[Webcam] Face captured successfully!")
+                
+                # Flash screen green
+                flash_frame = display_frame.copy()
+                cv2.rectangle(
+                    flash_frame, (0, 0),
+                    (flash_frame.shape[1], flash_frame.shape[0]),
+                    config.COLOR_GREEN, 10
                 )
+                cv2.imshow(self.window_name, flash_frame)
+                cv2.waitKey(200)
                 
-                # Show face count
-                if len(faces) > 0:
-                    status = f"{len(faces)} face(s) detected - Ready!"
-                    color = config.COLOR_GREEN
-                else:
-                    status = "No face detected - Position yourself"
-                    color = config.COLOR_RED
-                
-                cv2.putText(
-                    frame,
-                    status,
-                    (10, 60),
-                    config.FONT_FACE,
-                    config.FONT_SCALE,
-                    color,
-                    config.FONT_THICKNESS
-                )
-                
-                cv2.imshow(window_name, frame)
-            
-            # Handle key press
-            key = cv2.waitKey(1) & 0xFF
-            
-            if key == 27:  # ESC - cancel
-                print("[Webcam] Capture cancelled")
-                break
-            
-            elif key == ord(' '):  # SPACE - capture
-                if len(faces) == 0:
-                    print("[Webcam] No face detected, try again")
-                    continue
-                
-                # Crop largest face
-                captured_face = self.face_detector.detect_and_crop(
-                    frame,
-                    output_size=output_size
-                )
-                
-                if captured_face is not None:
-                    print("[Webcam] Face captured!")
-                    break
+                return captured_face
+            else:
+                print("[Webcam] Failed to crop face, try again")
+                return None  # Continue polling
         
-        if show_preview:
-            cv2.destroyWindow(window_name)
-        
-        return captured_face
+        # Still waiting for input
+        return None
     
     def get_fps(self) -> float:
         """Get current FPS."""
@@ -281,22 +284,24 @@ if __name__ == "__main__":
     # Test webcam capture
     print("Testing Webcam Capture...")
     
-    with WebcamCapture() as cam:
-        if not cam.is_opened:
-            print("Failed to open camera")
-        else:
-            print("Camera opened successfully!")
-            
-            # Capture 10 frames
-            for i in range(10):
-                frame, faces = cam.read_with_face_detection()
-                if frame is not None:
-                    print(f"Frame {i+1}: {frame.shape}, {len(faces)} faces")
-                time.sleep(0.1)
-            
-            # Test interactive capture (comment out for automated testing)
-            # face = cam.capture_face(output_size=(112, 112))
-            # if face is not None:
-            #     print(f"Captured face: {face.shape}")
+    # Test multiple captures
+    print("\nTesting multiple sequential captures...")
+    for i in range(3):
+        print(f"\n--- Capture {i+1} ---")
+        cam = WebcamCapture()
+        if cam.open():
+            # Simulate polling loop
+            while True:
+                face = cam.poll_for_capture()
+                if face is not None:
+                    if isinstance(face, np.ndarray):
+                        print(f"Captured face: {face.shape}")
+                        cv2.imwrite(f"test_capture_{i+1}.jpg", face)
+                        print(f"Saved to test_capture_{i+1}.jpg")
+                    break
+                time.sleep(0.01)  # Simulate GUI event loop delay
+            cam.close()
+        
+        time.sleep(1)
     
-    print("Webcam test complete!")
+    print("\nWebcam test complete!")

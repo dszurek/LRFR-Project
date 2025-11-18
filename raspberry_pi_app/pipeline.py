@@ -1,7 +1,7 @@
 """LRFR Pipeline for Raspberry Pi 5.
 
 Handles the complete low-resolution facial recognition pipeline:
-1. Load quantized DSR and EdgeFace models
+1. Load DSR and EdgeFace models
 2. Downscale input to VLR size
 3. Upscale with DSR to 112×112
 4. Extract embedding with EdgeFace
@@ -25,24 +25,36 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from technical.dsr.models import DSRColor, DSRConfig
+from technical.dsr.models import DSRColor, DSRConfig, load_dsr_model
 from technical.facial_rec.edgeface_weights.edgeface import EdgeFace
 import config
 
 
 class LRFRPipeline:
-    """Complete LRFR pipeline with quantized models for Pi 5."""
+    """Complete LRFR pipeline for Pi 5."""
     
-    def __init__(self, vlr_size: int = 32, device: str = "cpu"):
+    def __init__(
+        self, 
+        vlr_size: int = 32, 
+        device: str = "cpu",
+        dsr_model_path: Optional[str] = None,
+        edgeface_model_path: Optional[str] = None
+    ):
         """Initialize pipeline with specified VLR resolution.
         
         Args:
             vlr_size: VLR input size (16, 24, or 32)
             device: Device to run on ('cpu' for Pi 5)
+            dsr_model_path: Optional custom path to DSR model (uses default if None)
+            edgeface_model_path: Optional custom path to EdgeFace model (uses default if None)
         """
         self.vlr_size = vlr_size
         self.device = torch.device(device)
         self.hr_size = config.HR_SIZE
+        
+        # Store custom paths
+        self.custom_dsr_path = Path(dsr_model_path) if dsr_model_path else None
+        self.custom_edgeface_path = Path(edgeface_model_path) if edgeface_model_path else None
         
         # Set PyTorch threads for Pi 5
         torch.set_num_threads(config.TORCH_THREADS)
@@ -65,14 +77,18 @@ class LRFRPipeline:
         print(f"[Pipeline] Ready! (Device: {self.device})")
     
     def _load_dsr_model(self) -> DSRColor:
-        """Load quantized DSR model."""
-        dsr_path, _ = config.get_model_paths(self.vlr_size)
-        
-        if not dsr_path.exists():
-            raise FileNotFoundError(
-                f"DSR model not found: {dsr_path}\n"
-                f"Run 'git lfs pull' to download quantized models."
-            )
+        """Load DSR model."""
+        # Use custom path if provided, otherwise use default
+        if self.custom_dsr_path and self.custom_dsr_path.exists():
+            dsr_path = self.custom_dsr_path
+            print(f"[DSR] Using custom model: {dsr_path}")
+        else:
+            dsr_path, _ = config.get_model_paths(self.vlr_size)
+            if not dsr_path.exists():
+                raise FileNotFoundError(
+                    f"DSR model not found: {dsr_path}\n"
+                    f"Please ensure the model file exists."
+                )
         
         print(f"[DSR] Loading from {dsr_path.name}...")
         start = time.time()
@@ -85,26 +101,50 @@ class LRFRPipeline:
             output_size=cfg["output_size"]
         )
         
-        # Load model
-        model = DSRColor(config=dsr_config).to(self.device)
-        state_dict = torch.load(dsr_path, map_location=self.device)
-        model.load_state_dict(state_dict, strict=False)
-        model.eval()
+        # Use the proper load function that handles various checkpoint formats
+        try:
+            print(f"[DSR] Loading model with config: base_channels={cfg['base_channels']}, residual_blocks={cfg['residual_blocks']}")
+            model = load_dsr_model(
+                weights_path=dsr_path,
+                device=self.device,
+                config=dsr_config,
+                strict=False
+            )
+            print(f"[DSR] Model loaded successfully")
+        except Exception as e:
+            print(f"[DSR] ❌ Error loading model:")
+            print(f"[DSR]    Error type: {type(e).__name__}")
+            print(f"[DSR]    Error: {e}")
+            print(f"[DSR]    File: {dsr_path}")
+            import traceback
+            traceback.print_exc()
+            raise
         
         elapsed = (time.time() - start) * 1000
+        
+        # Count parameters
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        
         print(f"[DSR] Loaded in {elapsed:.0f}ms")
+        print(f"[DSR] Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+        print(f"[DSR] Trainable parameters: {trainable_params:,}")
         
         return model
     
     def _load_edgeface_model(self) -> EdgeFace:
-        """Load quantized EdgeFace model."""
-        _, edgeface_path = config.get_model_paths(self.vlr_size)
-        
-        if not edgeface_path.exists():
-            raise FileNotFoundError(
-                f"EdgeFace model not found: {edgeface_path}\n"
-                f"Run 'git lfs pull' to download quantized models."
-            )
+        """Load EdgeFace model."""
+        # Use custom path if provided, otherwise use default
+        if self.custom_edgeface_path and self.custom_edgeface_path.exists():
+            edgeface_path = self.custom_edgeface_path
+            print(f"[EdgeFace] Using custom model: {edgeface_path}")
+        else:
+            _, edgeface_path = config.get_model_paths(self.vlr_size)
+            if not edgeface_path.exists():
+                raise FileNotFoundError(
+                    f"EdgeFace model not found: {edgeface_path}\n"
+                    f"Please ensure the model file exists."
+                )
         
         print(f"[EdgeFace] Loading from {edgeface_path.name}...")
         start = time.time()
@@ -112,18 +152,52 @@ class LRFRPipeline:
         # Create model
         model = EdgeFace(embedding_size=512, back="edgeface_xxs")
         
-        # Load checkpoint
+        # Load checkpoint with detailed error logging
+        # The checkpoint may reference FinetuneConfig from __main__ or from the module
+        # We need to ensure it's available in both places for unpickling to work
+        from dataclasses import dataclass
+        import types
+        
         try:
             from technical.facial_rec.finetune_edgeface import FinetuneConfig
+            print(f"[EdgeFace] Imported FinetuneConfig from technical.facial_rec.finetune_edgeface")
         except ImportError:
-            # Stub for unpickling
-            from dataclasses import dataclass
+            # Create stub if module doesn't exist
             @dataclass
             class FinetuneConfig:
                 pass
-            sys.modules["technical.facial_rec.finetune_edgeface"].FinetuneConfig = FinetuneConfig
+
+            module_name = "technical.facial_rec.finetune_edgeface"
+            fake_mod = types.ModuleType(module_name)
+            fake_mod.FinetuneConfig = FinetuneConfig
+            sys.modules[module_name] = fake_mod
+            print(f"[EdgeFace] Created stub module {module_name} with FinetuneConfig")
         
-        checkpoint = torch.load(edgeface_path, map_location=self.device, weights_only=False)
+        # ALWAYS add FinetuneConfig to __main__ since checkpoint was saved from __main__ context
+        import __main__
+        if not hasattr(__main__, 'FinetuneConfig'):
+            __main__.FinetuneConfig = FinetuneConfig
+            print(f"[EdgeFace] Added FinetuneConfig to __main__ for unpickling")
+        
+        try:
+            print(f"[EdgeFace] Loading checkpoint from {edgeface_path}...")
+            checkpoint = torch.load(edgeface_path, map_location=self.device, weights_only=False)
+            print(f"[EdgeFace] Checkpoint loaded successfully")
+        except AttributeError as e:
+            print(f"[EdgeFace] ❌ AttributeError during torch.load (unpickling failed):")
+            print(f"[EdgeFace]    Error: {e}")
+            print(f"[EdgeFace]    This usually means a class/attribute referenced in the checkpoint cannot be found.")
+            print(f"[EdgeFace]    File: {edgeface_path}")
+            import traceback
+            traceback.print_exc()
+            raise
+        except Exception as e:
+            print(f"[EdgeFace] ❌ Unexpected error during torch.load:")
+            print(f"[EdgeFace]    Error type: {type(e).__name__}")
+            print(f"[EdgeFace]    Error: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
         
         # Extract state dict
         if isinstance(checkpoint, dict):
@@ -148,7 +222,14 @@ class LRFRPipeline:
         model.eval()
         
         elapsed = (time.time() - start) * 1000
+        
+        # Count parameters
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        
         print(f"[EdgeFace] Loaded in {elapsed:.0f}ms")
+        print(f"[EdgeFace] Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+        print(f"[EdgeFace] Trainable parameters: {trainable_params:,}")
         
         return model
     
@@ -200,10 +281,12 @@ class LRFRPipeline:
         """
         with torch.no_grad():
             sr_tensor = self.dsr_model(vlr_tensor)
+            # Handle potential NaN or inf values
+            sr_tensor = torch.nan_to_num(sr_tensor, nan=0.0, posinf=1.0, neginf=0.0)
             sr_tensor = torch.clamp(sr_tensor, 0.0, 1.0)
         
         # Convert to numpy for display: CHW -> HWC, RGB -> BGR, [0,1] -> [0,255]
-        sr_rgb = (sr_tensor.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+        sr_rgb = (sr_tensor.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
         sr_np = cv2.cvtColor(sr_rgb, cv2.COLOR_RGB2BGR)
         
         return sr_np, sr_tensor
@@ -242,6 +325,12 @@ class LRFRPipeline:
                 - timings: Dict with per-stage timing in ms
                 - total_time: Total processing time in ms
         """
+        # Validate models are loaded
+        if self.dsr_model is None:
+            raise RuntimeError("DSR model not loaded. Cannot process image.")
+        if self.edgeface_model is None:
+            raise RuntimeError("EdgeFace model not loaded. Cannot process image.")
+        
         result = {}
         timings = {}
         
