@@ -169,13 +169,13 @@ class MultiResolutionEvaluator:
         # Auto-detect resolution-specific checkpoints
         if dsr_checkpoint is None:
             base_dir = Path(__file__).parents[2] / "technical" / "dsr"
-            # Try resolution-specific checkpoint first, fall back to dsr.pth for 32x32
+            # Try resolution-specific checkpoint first, fall back to dsr32.pth for 32x32
             candidates = [
                 base_dir / f"dsr_{vlr_size}x{vlr_size}.pth",
                 base_dir / f"dsr{vlr_size}.pth",
             ]
             if vlr_size == 32:
-                candidates.append(base_dir / "dsr.pth")
+                candidates.append(base_dir / "dsr32.pth")
             
             for path in candidates:
                 if path.exists():

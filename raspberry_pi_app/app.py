@@ -281,7 +281,18 @@ class LRFRApp:
                     
                     # Compute embeddings if gallery exists
                     if self.gallery.size() > 0:
-                        self.gallery.compute_all_embeddings(self.pipeline)
+                        # Progress callback to update status
+                        def update_progress(current, total, name):
+                            msg = f"Computing embeddings: {name} ({current}/{total})"
+                            self.root.after(0, lambda: self._set_status(msg, "blue"))
+                        
+                        # Force recomputation based on config
+                        force = config.FORCE_RECOMPUTE_EMBEDDINGS_ON_STARTUP
+                        self.gallery.compute_all_embeddings(
+                            self.pipeline, 
+                            force=force,
+                            progress_callback=update_progress
+                        )
                 
                 # Update UI
                 self.root.after(0, self._on_initialization_complete)
@@ -362,9 +373,17 @@ class LRFRApp:
                         edgeface_model_path=edgeface_path
                     )
                     
-                    # Recompute embeddings
+                    # Recompute embeddings with progress callback
                     if self.gallery.size() > 0:
-                        self.gallery.compute_all_embeddings(self.pipeline)
+                        def update_progress(current, total, name):
+                            msg = f"Recomputing embeddings: {name} ({current}/{total})"
+                            self.root.after(0, lambda: self._set_status(msg, "blue"))
+                        
+                        self.gallery.compute_all_embeddings(
+                            self.pipeline,
+                            force=True,  # Always force on reload
+                            progress_callback=update_progress
+                        )
                 
                 self.root.after(0, self._on_reload_complete)
                 
@@ -683,14 +702,16 @@ class LRFRApp:
             
             self.results_text.insert(tk.END, "1:1 Verification Result\n", "header")
             self.results_text.insert(tk.END, f"\nTarget: {target}\n")
+            self.results_text.insert(tk.END, f"Similarity Score: {similarity:.4f} ({similarity:.2%})\n")
             
             if is_match:
-                self.results_text.insert(tk.END, f"✓ MATCH (Confidence: {similarity:.2%})\n", "match")
+                self.results_text.insert(tk.END, f"✓ MATCH\n", "match")
             else:
-                self.results_text.insert(tk.END, f"✗ NO MATCH (Similarity: {similarity:.2%})\n", "nomatch")
+                self.results_text.insert(tk.END, f"✗ NO MATCH\n", "nomatch")
             
             threshold = config.VERIFICATION_THRESHOLD_1_1
-            self.results_text.insert(tk.END, f"\nThreshold: {threshold:.2%}\n", "timing")
+            self.results_text.insert(tk.END, f"\nThreshold: {threshold:.4f} ({threshold:.2%})\n", "timing")
+            self.results_text.insert(tk.END, f"Note: Similarity = cosine similarity of embeddings (range: -1 to 1)\n", "timing")
             
         else:
             # 1:N Identification
@@ -707,10 +728,11 @@ class LRFRApp:
                 tag = "match" if is_valid else "nomatch"
                 
                 self.results_text.insert(tk.END, f"{rank}. {prefix} {name}\n", tag)
-                self.results_text.insert(tk.END, f"   Confidence: {similarity:.2%}\n\n")
+                self.results_text.insert(tk.END, f"   Similarity: {similarity:.4f} ({similarity:.2%})\n\n")
             
             threshold = config.IDENTIFICATION_THRESHOLD_1_N
-            self.results_text.insert(tk.END, f"\nMinimum threshold: {threshold:.2%}\n", "timing")
+            self.results_text.insert(tk.END, f"\nMinimum threshold: {threshold:.4f} ({threshold:.2%})\n", "timing")
+            self.results_text.insert(tk.END, f"Note: Similarity = cosine similarity (range: -1 to 1, higher is better)\n", "timing")
     
     def _update_metrics_display(self, result: Dict):
         """Update performance metrics display."""
@@ -926,12 +948,15 @@ class AddPersonDialog:
         self.callback = callback
         self.images = []
         self.is_capturing = False
+        self.is_auto_capturing = False
         self.webcam = None
+        self.face_detector = FaceDetector()
+        self.auto_capture_start_time = None
         
         # Create dialog
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Add Person")
-        self.dialog.geometry("500x400")
+        self.dialog.geometry("500x450")
         
         self._create_widgets()
     
@@ -952,12 +977,17 @@ class AddPersonDialog:
         button_frame = ttk.Frame(images_frame)
         button_frame.pack(fill=tk.X)
         
-        ttk.Button(button_frame, text="Capture from Webcam", command=self._capture_image).pack(side=tk.LEFT, padx=5)
+        self.auto_capture_btn = ttk.Button(button_frame, text="Auto Capture (100 photos)", command=self._auto_capture)
+        self.auto_capture_btn.pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Manual Capture", command=self._capture_image).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Load from File", command=self._load_image).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Clear All", command=self._clear_images).pack(side=tk.LEFT, padx=5)
         
         self.images_label = ttk.Label(images_frame, text=f"0/{config.MAX_IMAGES_PER_PERSON} images")
-        self.images_label.pack(pady=10)
+        self.images_label.pack(pady=5)
+        
+        self.status_label = ttk.Label(images_frame, text="", foreground="blue")
+        self.status_label.pack(pady=5)
         
         # Action buttons
         action_frame = ttk.Frame(main_frame)
@@ -967,12 +997,12 @@ class AddPersonDialog:
         ttk.Button(action_frame, text="Cancel", command=self.dialog.destroy).pack(side=tk.RIGHT, padx=5)
     
     def _capture_image(self):
-        """Capture image from webcam."""
+        """Capture image from webcam (manual mode - single capture)."""
         if len(self.images) >= config.MAX_IMAGES_PER_PERSON:
             messagebox.showwarning("Limit Reached", f"Maximum {config.MAX_IMAGES_PER_PERSON} images per person")
             return
         
-        if self.is_capturing:
+        if self.is_capturing or self.is_auto_capturing:
             messagebox.showwarning("Busy", "Webcam capture in progress...")
             return
         
@@ -988,8 +1018,195 @@ class AddPersonDialog:
         # Start polling
         self._webcam_poll()
     
+    def _auto_capture(self):
+        """Start automatic capture mode - captures 100 photos automatically."""
+        if self.is_capturing or self.is_auto_capturing:
+            messagebox.showwarning("Busy", "Webcam capture already in progress...")
+            return
+        
+        # Clear existing images
+        if self.images:
+            if not messagebox.askyesno("Clear Images?", f"This will clear the existing {len(self.images)} images. Continue?"):
+                return
+            self.images.clear()
+            self._update_images_label()
+        
+        self.is_auto_capturing = True
+        self.auto_capture_start_time = time.time()
+        
+        # Disable auto capture button
+        self.auto_capture_btn.config(state='disabled')
+        
+        # Update status
+        self.status_label.config(text="Starting auto capture... Position your face in frame and move slowly.", foreground="blue")
+        
+        # Create webcam with custom window name
+        self.webcam = WebcamCapture()
+        self.webcam.window_name = "Auto Capture - Move your head slowly around. ESC to stop"
+        
+        if not self.webcam.open():
+            self.is_auto_capturing = False
+            self.auto_capture_btn.config(state='normal')
+            messagebox.showerror("Webcam Error", "Failed to open webcam")
+            return
+        
+        # Start auto-capture polling
+        self._auto_capture_poll()
+    
+    def _auto_capture_poll(self):
+        """Poll webcam for automatic capture."""
+        if not self.is_auto_capturing or self.webcam is None:
+            return
+        
+        # Check if we've reached the limit
+        if len(self.images) >= config.MAX_IMAGES_PER_PERSON:
+            elapsed = time.time() - self.auto_capture_start_time
+            self.status_label.config(
+                text=f"Auto capture complete! Captured {len(self.images)} images in {elapsed:.1f} seconds.",
+                foreground="green"
+            )
+            self.webcam.close()
+            self.webcam = None
+            self.is_auto_capturing = False
+            self.auto_capture_btn.config(state='normal')
+            messagebox.showinfo("Complete", f"Successfully captured {len(self.images)} images!")
+            return
+        
+        # Read frame
+        if not self.webcam.is_opened or self.webcam.cap is None:
+            self._stop_auto_capture("Webcam closed unexpectedly")
+            return
+        
+        ret, frame = self.webcam.cap.read()
+        
+        if not ret or frame is None:
+            self._stop_auto_capture("Failed to read frame")
+            return
+        
+        # Update FPS
+        self.webcam.fps_frame_count += 1
+        elapsed = time.time() - self.webcam.fps_start_time
+        if elapsed >= 1.0:
+            self.webcam.current_fps = self.webcam.fps_frame_count / elapsed
+            self.webcam.fps_frame_count = 0
+            self.webcam.fps_start_time = time.time()
+        
+        # Detect faces
+        faces = self.face_detector.detect_faces(frame)
+        
+        # Create display frame
+        display_frame = frame.copy()
+        
+        # If face detected, capture it
+        face_detected = False
+        if faces:
+            face_detected = True
+            x, y, w, h = faces[0]
+            
+            # Draw rectangle
+            cv2.rectangle(
+                display_frame,
+                (x, y),
+                (x + w, y + h),
+                config.COLOR_GREEN,
+                2
+            )
+            
+            # Capture the face
+            captured_face = self.face_detector.detect_and_crop(
+                frame,
+                output_size=config.HR_SIZE
+            )
+            
+            if captured_face is not None:
+                self.images.append(captured_face.copy())
+                self.dialog.after(0, self._update_images_label)
+                
+                # Update status
+                elapsed = time.time() - self.auto_capture_start_time
+                self.status_label.config(
+                    text=f"Capturing... {len(self.images)}/{config.MAX_IMAGES_PER_PERSON} images ({elapsed:.1f}s)",
+                    foreground="blue"
+                )
+        
+        # Add overlay text
+        cv2.putText(
+            display_frame,
+            f"FPS: {self.webcam.current_fps:.1f}",
+            (10, 30),
+            config.FONT_FACE,
+            config.FONT_SCALE,
+            config.COLOR_GREEN,
+            config.FONT_THICKNESS
+        )
+        
+        status_text = f"Captured: {len(self.images)}/{config.MAX_IMAGES_PER_PERSON}"
+        cv2.putText(
+            display_frame,
+            status_text,
+            (10, 60),
+            config.FONT_FACE,
+            config.FONT_SCALE,
+            config.COLOR_GREEN if face_detected else config.COLOR_RED,
+            config.FONT_THICKNESS
+        )
+        
+        instruction_text = "Move your head slowly - looking left, right, up, down"
+        cv2.putText(
+            display_frame,
+            instruction_text,
+            (10, 90),
+            config.FONT_FACE,
+            config.FONT_SCALE * 0.7,
+            config.COLOR_YELLOW,
+            config.FONT_THICKNESS
+        )
+        
+        if not face_detected:
+            cv2.putText(
+                display_frame,
+                "No face detected - position yourself in frame",
+                (10, 120),
+                config.FONT_FACE,
+                config.FONT_SCALE * 0.7,
+                config.COLOR_RED,
+                config.FONT_THICKNESS
+            )
+        
+        cv2.putText(
+            display_frame,
+            "ESC to stop",
+            (10, display_frame.shape[0] - 20),
+            config.FONT_FACE,
+            config.FONT_SCALE,
+            config.COLOR_YELLOW,
+            config.FONT_THICKNESS
+        )
+        
+        # Show frame
+        cv2.imshow(self.webcam.window_name, display_frame)
+        
+        # Check for ESC key
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:  # ESC
+            self._stop_auto_capture(f"Stopped by user. Captured {len(self.images)} images.")
+            return
+        
+        # Continue polling
+        self.dialog.after(10, self._auto_capture_poll)
+    
+    def _stop_auto_capture(self, message: str):
+        """Stop auto capture and clean up."""
+        if self.webcam:
+            self.webcam.close()
+            self.webcam = None
+        
+        self.is_auto_capturing = False
+        self.auto_capture_btn.config(state='normal')
+        self.status_label.config(text=message, foreground="orange")
+    
     def _webcam_poll(self):
-        """Poll webcam for frames."""
+        """Poll webcam for frames (manual mode)."""
         if not self.is_capturing or self.webcam is None:
             return
         

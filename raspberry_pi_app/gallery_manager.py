@@ -108,6 +108,11 @@ class GalleryManager:
         Returns:
             True if successfully added, False otherwise
         """
+        print(f"[Gallery] Starting add_person for '{name}'")
+        print(f"[Gallery]   Images provided: {len(images)}")
+        print(f"[Gallery]   Current gallery size: {len(self.people)}")
+        print(f"[Gallery]   Overwrite: {overwrite}")
+        
         # Check if exists
         if name in self.people and not overwrite:
             print(f"[Gallery] Person '{name}' already exists. Use overwrite=True to replace.")
@@ -127,17 +132,22 @@ class GalleryManager:
             print(f"[Gallery] Gallery full ({config.MAX_GALLERY_SIZE} people max)")
             return False
         
+        print(f"[Gallery] Creating person directory...")
         # Create person directory
         person_dir = self.gallery_dir / name.replace(" ", "_")
         if person_dir.exists():
+            print(f"[Gallery] Removing existing directory: {person_dir}")
             shutil.rmtree(person_dir)  # Remove old images
         person_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[Gallery] Person directory created: {person_dir}")
         
         # Process and save images
         image_paths = []
         processed_images = []
         
+        print(f"[Gallery] Processing {len(images)} images...")
         for i, img in enumerate(images):
+            print(f"[Gallery]   Processing image {i+1}/{len(images)}...")
             # Detect and crop face
             face = self.face_detector.detect_and_crop(
                 img, 
@@ -145,9 +155,10 @@ class GalleryManager:
             )
             
             if face is None:
-                print(f"[Gallery] Warning: No face detected in image {i+1}, skipping")
+                print(f"[Gallery]   Warning: No face detected in image {i+1}, skipping")
                 continue
             
+            print(f"[Gallery]   Face detected, saving...")
             # Save image
             img_filename = f"{i:03d}.jpg"
             img_path = person_dir / img_filename
@@ -157,20 +168,58 @@ class GalleryManager:
             rel_path = str(img_path.relative_to(self.gallery_dir))
             image_paths.append(rel_path)
             processed_images.append(face)
+            print(f"[Gallery]   Saved as {img_filename}")
         
+        print(f"[Gallery] Processed {len(image_paths)} valid faces")
         if len(image_paths) < config.MIN_IMAGES_PER_PERSON:
             print(f"[Gallery] Not enough valid faces detected ({len(image_paths)}/{config.MIN_IMAGES_PER_PERSON})")
             shutil.rmtree(person_dir)
             return False
         
         # Compute average embedding if pipeline provided
+        # OPTIMIZATION: Only use a subset of images for embedding computation
+        # Since we can have up to 100 images, processing all would be very slow
         embedding = None
         if pipeline is not None:
-            embeddings = []
-            for img in processed_images:
-                result = pipeline.process_image(img, return_intermediate=False)
-                embeddings.append(result["embedding"])
+            # Use at most MAX_IMAGES_FOR_EMBEDDING images for computing embedding
+            max_images_for_embedding = min(config.MAX_IMAGES_FOR_EMBEDDING, len(processed_images))
             
+            # Sample evenly across all images using linspace-like distribution
+            # This ensures we cover the full range from first to last image
+            if max_images_for_embedding >= len(processed_images):
+                sampled_indices = list(range(len(processed_images)))
+            else:
+                # Evenly distribute indices across the full range
+                sampled_indices = [
+                    int(i * (len(processed_images) - 1) / (max_images_for_embedding - 1))
+                    for i in range(max_images_for_embedding)
+                ]
+            
+            print(f"[Gallery] Computing embeddings using {max_images_for_embedding} of {len(processed_images)} images...")
+            print(f"[Gallery] Sampled indices: {sampled_indices}")
+            print(f"[Gallery] Pipeline object: {pipeline}")
+            print(f"[Gallery] Pipeline DSR model: {pipeline.dsr_model}")
+            print(f"[Gallery] Pipeline EdgeFace model: {pipeline.edgeface_model}")
+            
+            embeddings = []
+            for idx in sampled_indices:
+                img = processed_images[idx]
+                print(f"[Gallery]   Computing embedding for image {idx+1}/{len(processed_images)}...")
+                print(f"[Gallery]   Image shape: {img.shape}, dtype: {img.dtype}, min: {img.min()}, max: {img.max()}")
+                try:
+                    result = pipeline.process_image(img, return_intermediate=False)
+                    print(f"[Gallery]   Result keys: {result.keys()}")
+                    print(f"[Gallery]   Embedding shape: {result['embedding'].shape}")
+                    embeddings.append(result["embedding"])
+                    print(f"[Gallery]   Embedding computed successfully")
+                except Exception as e:
+                    print(f"[Gallery]   ERROR computing embedding for image {idx+1}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    shutil.rmtree(person_dir)
+                    return False
+            
+            print(f"[Gallery] Averaging {len(embeddings)} embeddings...")
             # Average embeddings and re-normalize
             avg_embedding = np.mean(embeddings, axis=0)
             avg_embedding = avg_embedding / np.linalg.norm(avg_embedding)
@@ -180,6 +229,7 @@ class GalleryManager:
             del embeddings
             del avg_embedding
         
+        print(f"[Gallery] Creating PersonEntry...")
         # Create entry
         person = PersonEntry(
             name=name,
@@ -188,6 +238,7 @@ class GalleryManager:
         )
         
         self.people[name] = person
+        print(f"[Gallery] Saving metadata...")
         self._save_metadata()
         
         print(f"[Gallery] Added '{name}' with {len(image_paths)} images")
@@ -261,26 +312,60 @@ class GalleryManager:
         images = self.get_person_images(name)
         return images[0] if images else None
     
-    def compute_all_embeddings(self, pipeline) -> int:
+    def compute_all_embeddings(self, pipeline, force: bool = False, progress_callback=None) -> int:
         """Compute embeddings for all people in gallery.
+        
+        OPTIMIZATION: Only recomputes if embeddings are missing (None).
+        If embeddings are already saved in metadata, they are preserved.
         
         Args:
             pipeline: LRFRPipeline instance
+            force: If True, recompute even if embeddings exist
+            progress_callback: Optional callback(current, total, name) for progress updates
         
         Returns:
             Number of people processed
         """
+        all_names = self.get_all_names()
+        total_people = len(all_names)
         count = 0
         
-        for name in self.get_all_names():
+        for idx, name in enumerate(all_names):
+            person = self.people[name]
+            
+            # Skip if embedding already exists (unless force=True)
+            if not force and person.embedding is not None:
+                print(f"[Gallery] Skipping '{name}' - embedding already exists")
+                if progress_callback:
+                    progress_callback(idx + 1, total_people, name)
+                continue
+            
             images = self.get_person_images(name)
             
             if not images:
+                if progress_callback:
+                    progress_callback(idx + 1, total_people, name)
                 continue
+            
+            # OPTIMIZATION: Use at most MAX_IMAGES_FOR_EMBEDDING images for embedding computation
+            max_images_for_embedding = min(config.MAX_IMAGES_FOR_EMBEDDING, len(images))
+            
+            # Sample evenly across all images using linspace-like distribution
+            if max_images_for_embedding >= len(images):
+                sampled_images = images
+            else:
+                # Evenly distribute indices across the full range
+                sampled_indices = [
+                    int(i * (len(images) - 1) / (max_images_for_embedding - 1))
+                    for i in range(max_images_for_embedding)
+                ]
+                sampled_images = [images[idx] for idx in sampled_indices]
+            
+            print(f"[Gallery] Computing embedding for '{name}' using {len(sampled_images)}/{len(images)} images...")
             
             # Compute embeddings
             embeddings = []
-            for img in images:
+            for img in sampled_images:
                 result = pipeline.process_image(img, return_intermediate=False)
                 embeddings.append(result["embedding"])
             
@@ -291,9 +376,16 @@ class GalleryManager:
             # Update person
             self.people[name].embedding = avg_embedding.tolist()
             count += 1
+            
+            # Update progress
+            if progress_callback:
+                progress_callback(idx + 1, total_people, name)
         
-        self._save_metadata()
-        print(f"[Gallery] Computed embeddings for {count} people")
+        if count > 0:
+            self._save_metadata()
+            print(f"[Gallery] Computed embeddings for {count} people")
+        else:
+            print(f"[Gallery] All embeddings already exist - no computation needed")
         
         return count
     

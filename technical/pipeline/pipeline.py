@@ -55,7 +55,7 @@ def _require_torch() -> None:
 class PipelineConfig:
     """Runtime configuration for the face pipeline."""
 
-    dsr_weights_path: Path = Path("dsr/dsr.pth")
+    dsr_weights_path: Path = Path("dsr/dsr32.pth")
     edgeface_weights_path: Path = Path(
         "facial_rec/edgeface_weights/edgeface_finetuned.pth"
     )

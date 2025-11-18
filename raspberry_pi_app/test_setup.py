@@ -50,7 +50,7 @@ def check_dependencies():
 
 
 def check_models():
-    """Check if quantized models are downloaded."""
+    """Check if model files are available."""
     print("\n" + "=" * 60)
     print("Checking Model Files...")
     print("=" * 60)

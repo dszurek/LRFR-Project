@@ -1,2 +1,4 @@
 /technical/dataset/*
 /technical/local_packages/*
+*pt
+*.pth

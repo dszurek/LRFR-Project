@@ -12,14 +12,14 @@ from pathlib import Path
 APP_DIR = Path(__file__).parent
 PROJECT_ROOT = APP_DIR.parent
 
-# Model paths (quantized for Pi 5 performance)
-DSR_MODEL_16 = PROJECT_ROOT / "technical" / "dsr" / "quantized" / "dsr16_quantized_dynamic.pth"
-DSR_MODEL_24 = PROJECT_ROOT / "technical" / "dsr" / "quantized" / "dsr24_quantized_dynamic.pth"
-DSR_MODEL_32 = PROJECT_ROOT / "technical" / "dsr" / "quantized" / "dsr32_quantized_dynamic.pth"
+# Model paths (using non-quantized models for better quality)
+DSR_MODEL_16 = PROJECT_ROOT / "technical" / "dsr" / "dsr16.pth"
+DSR_MODEL_24 = PROJECT_ROOT / "technical" / "dsr" / "dsr24.pth"
+DSR_MODEL_32 = PROJECT_ROOT / "technical" / "dsr" / "dsr32.pth"
 
-EDGEFACE_MODEL_16 = PROJECT_ROOT / "technical" / "facial_rec" / "edgeface_weights" / "quantized" / "edgeface_finetuned_16_quantized_dynamic.pth"
-EDGEFACE_MODEL_24 = PROJECT_ROOT / "technical" / "facial_rec" / "edgeface_weights" / "quantized" / "edgeface_finetuned_24_quantized_dynamic.pth"
-EDGEFACE_MODEL_32 = PROJECT_ROOT / "technical" / "facial_rec" / "edgeface_weights" / "quantized" / "edgeface_finetuned_32_quantized_dynamic.pth"
+EDGEFACE_MODEL_16 = PROJECT_ROOT / "technical" / "facial_rec" / "edgeface_weights" / "edgeface_finetuned_16.pth"
+EDGEFACE_MODEL_24 = PROJECT_ROOT / "technical" / "facial_rec" / "edgeface_weights" / "edgeface_finetuned_24.pth"
+EDGEFACE_MODEL_32 = PROJECT_ROOT / "technical" / "facial_rec" / "edgeface_weights" / "edgeface_finetuned_32.pth"
 
 # Haar Cascade for face detection (built into OpenCV)
 HAAR_CASCADE_FACE = "haarcascade_frontalface_default.xml"
@@ -34,16 +34,28 @@ GALLERY_METADATA = APP_DIR / "data" / "gallery.json"
 
 MAX_GALLERY_SIZE = 5  # Maximum number of people in gallery
 MIN_IMAGES_PER_PERSON = 3  # Minimum images required to enroll
-MAX_IMAGES_PER_PERSON = 10  # Maximum images per person
+MAX_IMAGES_PER_PERSON = 100  # Maximum images per person (increased from 10)
 GALLERY_IMAGE_SIZE = (112, 112)  # Store as HR size
+
+# Embedding computation optimization
+# When adding a person with many images, only use a subset for computing embedding
+# This significantly speeds up gallery registration and app initialization
+# SET TO 100: Use all images for maximum accuracy
+MAX_IMAGES_FOR_EMBEDDING = 100  # Use at most this many images for embedding computation
+
+# Force recomputation of embeddings on app startup
+# Set to True to always recompute embeddings (slower but ensures accuracy)
+# Set to False to reuse saved embeddings (faster but may use outdated embeddings)
+FORCE_RECOMPUTE_EMBEDDINGS_ON_STARTUP = True
 
 # ============================================================================
 # Face Detection Settings
 # ============================================================================
 
-FACE_DETECTION_SCALE_FACTOR = 1.1  # Lower = more sensitive, slower
-FACE_DETECTION_MIN_NEIGHBORS = 5  # Higher = stricter detection
-FACE_MIN_SIZE = (80, 80)  # Minimum face size in pixels
+# More lenient face detection settings for gallery registration
+FACE_DETECTION_SCALE_FACTOR = 1.05  # Lower = more sensitive (was 1.1)
+FACE_DETECTION_MIN_NEIGHBORS = 3  # Lower = more lenient (was 5)
+FACE_MIN_SIZE = (60, 60)  # Smaller minimum face size (was 80x80)
 FACE_PADDING = 0.2  # Add 20% padding around detected face
 
 # ============================================================================
@@ -71,9 +83,9 @@ HR_SIZE = (112, 112)
 # Verification/Identification Settings
 # ============================================================================
 
-# Cosine similarity thresholds
-VERIFICATION_THRESHOLD_1_1 = 0.5  # 1:1 verification (higher = stricter)
-IDENTIFICATION_THRESHOLD_1_N = 0.3  # 1:N identification (lower = more permissive)
+# Cosine similarity thresholds (increased for stricter matching)
+VERIFICATION_THRESHOLD_1_1 = 0.65  # 1:1 verification (higher = stricter, was 0.5)
+IDENTIFICATION_THRESHOLD_1_N = 0.50  # 1:N identification (higher = stricter, was 0.3)
 
 # Top-K predictions to display
 TOP_K = 5

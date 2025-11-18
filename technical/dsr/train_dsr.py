@@ -558,7 +558,7 @@ def train(config: TrainConfig, args: argparse.Namespace) -> None:
 
     weights_path = base_dir.parent / "facial_rec" / "edgeface_weights" / args.edgeface
     save_path = base_dir / f"dsr{config.vlr_size}.pth"
-    legacy_save_path = base_dir / "dsr.pth" if config.vlr_size == 32 else None
+    legacy_save_path = base_dir / "dsr32.pth" if config.vlr_size == 32 else None
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device)

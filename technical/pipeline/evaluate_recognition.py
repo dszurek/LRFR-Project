@@ -321,7 +321,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dsr-weights",
         type=Path,
-        default=Path("technical/dsr/dsr.pth"),
+        default=Path("technical/dsr/dsr32.pth"),
         help="Path to DSR weights.",
     )
     parser.add_argument(
