@@ -1,9 +1,11 @@
 """Configuration for Raspberry Pi 5 LRFR Application.
 
 All paths and parameters are centralized here for easy customization.
+Works on both Windows (development) and Raspberry Pi (deployment).
 """
 
 from pathlib import Path
+import platform
 
 # ============================================================================
 # Project Paths
@@ -12,7 +14,11 @@ from pathlib import Path
 APP_DIR = Path(__file__).parent
 PROJECT_ROOT = APP_DIR.parent
 
-# Model paths (using non-quantized models for better quality)
+# Detect platform for platform-specific settings
+IS_WINDOWS = platform.system() == "Windows"
+IS_RASPBERRY_PI = platform.system() == "Linux" and platform.machine() in ["aarch64", "armv7l"]
+
+# Model paths - Use full-scale (non-quantized) models on all platforms
 DSR_MODEL_16 = PROJECT_ROOT / "technical" / "dsr" / "dsr16.pth"
 DSR_MODEL_24 = PROJECT_ROOT / "technical" / "dsr" / "dsr24.pth"
 DSR_MODEL_32 = PROJECT_ROOT / "technical" / "dsr" / "dsr32.pth"
@@ -94,11 +100,15 @@ TOP_K = 5
 # Performance Settings
 # ============================================================================
 
-# Device
-DEVICE = "cpu"  # Pi 5 runs on CPU
+# Device - auto-detect CUDA availability
+import torch
+if torch.cuda.is_available():
+    DEVICE = "cuda"  # Use GPU if available
+else:
+    DEVICE = "cpu"  # CPU fallback
 
 # Number of threads for PyTorch
-TORCH_THREADS = 4  # Pi 5 has 4 cores
+TORCH_THREADS = 4  # Pi 5 has 4 cores; adjust for your Windows system if needed
 
 # Memory optimization
 TORCH_DETERMINISTIC = False  # Disable for speed

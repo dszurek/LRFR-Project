@@ -36,7 +36,7 @@ class LRFRPipeline:
     def __init__(
         self, 
         vlr_size: int = 32, 
-        device: str = "cpu",
+        device: Optional[str] = None,
         dsr_model_path: Optional[str] = None,
         edgeface_model_path: Optional[str] = None
     ):
@@ -44,12 +44,14 @@ class LRFRPipeline:
         
         Args:
             vlr_size: VLR input size (16, 24, or 32)
-            device: Device to run on ('cpu' for Pi 5)
+            device: Device to run on (None = auto-detect from config, 'cpu', or 'cuda')
             dsr_model_path: Optional custom path to DSR model (uses default if None)
             edgeface_model_path: Optional custom path to EdgeFace model (uses default if None)
         """
         self.vlr_size = vlr_size
-        self.device = torch.device(device)
+        # Use config.DEVICE if device not specified
+        device_str = device if device is not None else config.DEVICE
+        self.device = torch.device(device_str)
         self.hr_size = config.HR_SIZE
         
         # Store custom paths
