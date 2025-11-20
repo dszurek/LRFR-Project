@@ -115,5 +115,8 @@ poetry run python -m tests.evaluate_cli --resolutions 16 24 32 --output-dir eval
 
 ---
 
+## Acknowledgements
+Big thanks to the creators of the EdgeFace model for creating such a lightweight and effective facial recognition model! You can find their work at [EdgeFace on GitHub](https://github.com/otroshi/edgeface)
+
 ## 📝 License
 Academic Research Use Only.
