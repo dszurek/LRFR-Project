@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -90,7 +90,7 @@ def _load_checkpoint(
 ) -> tuple[dict[str, torch.Tensor], dict]:
     """Return the checkpoint state dict along with raw metadata."""
 
-    checkpoint = torch.load(Path(weights_path), map_location=device)
+    checkpoint = torch.load(Path(weights_path), map_location=device, weights_only=False)
 
     state_dict: Optional[dict[str, torch.Tensor]] = None
     metadata: dict = {}
@@ -135,6 +135,11 @@ def _strip_prefixes(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return cleaned
 
 
+def _is_hybrid_dsr(state: dict[str, torch.Tensor]) -> bool:
+    """Detect if checkpoint is a Hybrid DSR model (has transformer blocks)."""
+    return any(key.startswith("transformer_blocks.") for key in state)
+
+
 def _infer_dsr_config(state: dict[str, torch.Tensor]) -> DSRConfig:
     """Infer DSRConfig fields from checkpoint tensor shapes."""
 
@@ -160,14 +165,65 @@ def load_dsr_model(
     device: torch.device | str = "cpu",
     config: Optional[DSRConfig] = None,
     strict: bool = False,
-) -> DSRColor:
-    """Instantiate and load the DSR model on the requested device."""
+) -> Union[DSRColor, "HybridDSR"]:
+    """Instantiate and load the DSR model on the requested device.
+    
+    Automatically detects whether the checkpoint is a basic DSR or Hybrid DSR
+    and loads the appropriate architecture.
+    """
 
     device = torch.device(device)
     state_dict, metadata = _load_checkpoint(weights_path, device)
 
     state_dict = _strip_prefixes(state_dict)
 
+    # Detect if this is a hybrid DSR model
+    if _is_hybrid_dsr(state_dict):
+        # Import here to avoid circular dependency
+        from .hybrid_model import HybridDSR, HybridDSRConfig
+        
+        # Try to get config from metadata
+        hybrid_config = None
+        if isinstance(metadata, dict) and "config" in metadata:
+            meta_config = metadata["config"]
+            if isinstance(meta_config, dict):
+                # Try to extract vlr_size/input_size from training config
+                vlr_size = meta_config.get("vlr_size") or meta_config.get("input_size")
+                
+                if vlr_size:
+                    # Use the factory function to get correct architecture for this resolution
+                    from .hybrid_model import create_hybrid_dsr
+                    model = create_hybrid_dsr(vlr_size, target_size=112)
+                    hybrid_config = model.config
+                else:
+                    # Try to construct HybridDSRConfig directly from metadata
+                    try:
+                        hybrid_config = HybridDSRConfig(**meta_config)
+                    except Exception:
+                        hybrid_config = None
+        
+        if hybrid_config is None:
+            # Fall back to inference from state dict (may not get input_size right)
+            from .hybrid_model import infer_hybrid_config
+            hybrid_config = infer_hybrid_config(state_dict)
+            print("[Hybrid DSR] Warning: Could not determine input_size from metadata, using inference")
+        
+        # Create model if we don't have it yet
+        if 'model' not in locals():
+            model = HybridDSR(hybrid_config)
+        
+        missing, unexpected = model.load_state_dict(state_dict, strict=strict)
+        
+        if missing and not strict:
+            print(f"[Hybrid DSR] Warning - missing keys: {missing[:5]}..." if len(missing) > 5 else f"[Hybrid DSR] Warning - missing keys: {missing}")
+        if unexpected and not strict:
+            print(f"[Hybrid DSR] Warning - unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"[Hybrid DSR] Warning - unexpected keys: {unexpected}")
+        
+        model.to(device)
+        model.eval()
+        return model
+    
+    # Load basic DSR model
     effective_config = config
     if effective_config is None:
         meta_config = None

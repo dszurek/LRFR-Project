@@ -1,0 +1,13 @@
+opencv-python
+tqdm
+timm
+torch>=2.0.0
+torchvision>=0.15.0
+scikit-image>=0.25.2
+scipy>=1.16.2
+Pillow>=10.4.0
+matplotlib>=3.10.7
+seaborn>=0.13.2
+scikit-learn>=1.7.2
+reportlab>=4.4.5
+pytest>=8.4.2

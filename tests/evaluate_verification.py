@@ -92,11 +92,10 @@ def load_image_tensor(
     img = Image.open(image_path).convert("RGB")
     
     if for_edgeface:
-        # EdgeFace expects 112×112 normalized to [-1, 1]
+        # EdgeFace expects 112×112 (normalization will be applied by pipeline.infer_embedding)
         transform = transforms.Compose([
             transforms.Resize((112, 112)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
     else:
         transform = transforms.ToTensor()

@@ -47,7 +47,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from PIL import Image
-from torch.cuda.amp import GradScaler, autocast
+
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
@@ -106,29 +107,31 @@ class FinetuneConfig:
         
         if vlr_size <= 16:
             # 16×16 needs more aggressive fine-tuning
+            cfg.stage1_epochs = max(cfg.stage1_epochs, 15)
+            cfg.stage2_epochs = max(cfg.stage2_epochs, 40)
+            cfg.batch_size = 256  # A100 optimization
+            cfg.head_lr = 1.5e-4
+            cfg.backbone_lr = 5e-6
+            cfg.head_lr_stage2 = 5e-5
+            cfg.arcface_scale = 12.0
+            cfg.temperature = 3.0
+            cfg.early_stop_patience = 15
+        elif vlr_size <= 24:
+            # 24×24 moderate adjustments
             cfg.stage1_epochs = max(cfg.stage1_epochs, 12)
-            cfg.stage2_epochs = max(cfg.stage2_epochs, 30)
-            cfg.batch_size = min(cfg.batch_size, 24)
-            cfg.head_lr = 1.2e-4
+            cfg.stage2_epochs = max(cfg.stage2_epochs, 35)
+            cfg.batch_size = 256  # A100 optimization
+            cfg.head_lr = 1.3e-4
             cfg.backbone_lr = 4e-6
             cfg.head_lr_stage2 = 4e-5
             cfg.arcface_scale = 10.0
             cfg.temperature = 3.5
             cfg.early_stop_patience = 12
-        elif vlr_size <= 24:
-            # 24×24 moderate adjustments
-            cfg.stage1_epochs = max(cfg.stage1_epochs, 11)
-            cfg.stage2_epochs = max(cfg.stage2_epochs, 27)
-            cfg.batch_size = min(cfg.batch_size, 28)
-            cfg.head_lr = 1.1e-4
-            cfg.backbone_lr = 3.5e-6
-            cfg.head_lr_stage2 = 3.5e-5
-            cfg.arcface_scale = 9.0
-            cfg.temperature = 3.7
-            cfg.early_stop_patience = 11
         else:
             # 32×32 uses base configuration
             cfg.vlr_size = 32
+            cfg.batch_size = 256  # A100 optimization
+            cfg.stage2_epochs = 30
         
         return cfg
 
@@ -498,7 +501,7 @@ def train_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=device.type == "cuda"):
+        with autocast('cuda', enabled=device.type == "cuda"):
             # Get embeddings from DSR outputs
             sr_embeddings = model(sr_imgs)
 
@@ -735,14 +738,14 @@ def main(args: argparse.Namespace) -> None:
         train_dir = (
             Path(args.train_dir)
             if getattr(args, "train_dir", None)
-            else base_dir / "technical" / "dataset" / "train_processed"
+            else base_dir / "technical" / "dataset" / "edgeface_finetune" / "train"
         )
         val_dir = (
             Path(args.val_dir)
             if getattr(args, "val_dir", None)
-            else base_dir / "technical" / "dataset" / "val_processed"
+            else base_dir / "technical" / "dataset" / "edgeface_finetune" / "val"
         )
-        print("⚠️  Using full dataset (many classes - may not be ideal for small gallery scenarios)")
+        print("⚠️  Using edgeface_finetune dataset (optimized for identity learning)")
 
     if getattr(args, "edgeface_weights", None):
         edgeface_weights = Path(args.edgeface_weights)
@@ -753,7 +756,7 @@ def main(args: argparse.Namespace) -> None:
     dsr_weights = (
         Path(args.dsr_weights)
         if getattr(args, "dsr_weights", None)
-        else base_dir / "technical" / "dsr" / f"dsr{args.vlr_size}.pth"
+        else base_dir / "technical" / "dsr" / f"hybrid_dsr{args.vlr_size}.pth"
     )
     
     # Save resolution-specific EdgeFace weights
@@ -834,18 +837,6 @@ def main(args: argparse.Namespace) -> None:
     for param in backbone.parameters():
         param.requires_grad = False
 
-    optimizer = optim.AdamW(
-        arcface.parameters(),
-        lr=config.head_lr,
-        weight_decay=config.weight_decay,
-    )
-    scaler = GradScaler(enabled=device.type == "cuda")
-
-    best_val_similarity = 0.0
-    train_subject_ids = set(train_dataset.subject_to_id.values())
-
-    print(f"\n[Info] Training on {len(train_subject_ids)} subjects")
-    print(f"[Info] Random guessing baseline accuracy: {1.0/len(train_subject_ids):.4f}")
     print(f"[Info] With {len(train_subject_ids)} classes, accuracy will start low and improve gradually")
     print(f"[Info] PRIMARY METRIC: Embedding similarity (should stay >0.95)")
 

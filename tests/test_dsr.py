@@ -24,17 +24,29 @@ try:
     from technical.dsr.models import (
         DSRColor,
         DSRConfig,
-    )  # adjust if your model lives elsewhere
+    )
+    from technical.dsr.hybrid_model import (
+        HybridDSR,
+        HybridDSRConfig,
+    )
 except Exception:
     # fallback: try package relative import (if you run as module this won't be used)
     from .models import DSRColor, DSRConfig  # type: ignore
+    from .hybrid_model import HybridDSR, HybridDSRConfig  # type: ignore
 
 # ---------- Config ----------
 # DSR model checkpoints for different resolutions
+# Try hybrid models first, fall back to original DSR if not found
 MODEL_PATHS = {
+    16: Path(__file__).resolve().parent / "hybrid_dsr16.pth",
+    24: Path(__file__).resolve().parent / "hybrid_dsr24.pth",
+    32: Path(__file__).resolve().parent / "hybrid_dsr32.pth",
+}
+# Fallback to old DSR models if hybrid models don't exist
+FALLBACK_MODEL_PATHS = {
     16: Path(__file__).resolve().parent / "dsr16.pth",
     24: Path(__file__).resolve().parent / "dsr24.pth",
-    32: Path(__file__).resolve().parent / "dsr32.pth",  # Default 32x32 model
+    32: Path(__file__).resolve().parent / "dsr32.pth",
 }
 # Try frontal-only HR directory first
 CANDIDATE_HR_DIRS = [
@@ -95,7 +107,7 @@ def _infer_dsr_config(state: dict[str, torch.Tensor]) -> DSRConfig:
 
 def robust_load_checkpoint(path: Path, device: torch.device, vlr_size: int):
     """Load checkpoint at `path`, build model using inferred config, and load matching params."""
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
 
     # Extract state dict
     if isinstance(ckpt, dict):
@@ -111,18 +123,79 @@ def robust_load_checkpoint(path: Path, device: torch.device, vlr_size: int):
         else:
             raise RuntimeError(f"Unsupported checkpoint object: {type(ckpt)}")
 
-    # Instantiate model with matching config
-    config = _infer_dsr_config(state)
+    # Detect if this is a hybrid model (has transformer attention blocks)
+    is_hybrid = any("attention" in k or "norm" in k for k in state.keys())
+    
+    if is_hybrid:
+        print(f"[load] Detected hybrid DSR model")
+        
+        # Infer architecture from state dict shapes
+        base_channels = 64  # default
+        if "shallow_feat.weight" in state:
+            base_channels = state["shallow_feat.weight"].shape[0]
+        
+        # Count residual blocks
+        res_block_indices = set()
+        for key in state.keys():
+            if key.startswith("res_blocks."):
+                parts = key.split(".")
+                if len(parts) > 1 and parts[1].isdigit():
+                    res_block_indices.add(int(parts[1]))
+        num_residual_blocks = len(res_block_indices) if res_block_indices else 8
+        
+        # Count transformer blocks
+        transformer_indices = set()
+        for key in state.keys():
+            if key.startswith("transformer_blocks."):
+                parts = key.split(".")
+                if len(parts) > 1 and parts[1].isdigit():
+                    transformer_indices.add(int(parts[1]))
+        num_transformer_blocks = len(transformer_indices) if transformer_indices else 2
+        
+        # Get transformer dim
+        transformer_dim = 256  # default
+        if "to_transformer.weight" in state:
+            transformer_dim = state["to_transformer.weight"].shape[0]
+        
+        # Get output size from config if available
+        output_size = 112
+        if isinstance(ckpt, dict) and "config" in ckpt:
+            cfg = ckpt["config"]
+            if "target_hr_size" in cfg:
+                output_size = cfg["target_hr_size"]
+            elif "hr_size" in cfg:
+                output_size = cfg["hr_size"]
+            elif "output_size" in cfg:
+                output_size = cfg["output_size"]
+        
+        config = HybridDSRConfig(
+            input_size=vlr_size,
+            output_size=output_size,
+            base_channels=base_channels,
+            num_residual_blocks=num_residual_blocks,
+            num_transformer_blocks=num_transformer_blocks,
+            transformer_dim=transformer_dim,
+        )
+        
+        print(f"[load] Inferred config: base_channels={base_channels}, "
+              f"residual_blocks={num_residual_blocks}, transformer_blocks={num_transformer_blocks}")
+        
+        model = HybridDSR(config).to(device)
+        print(f"[load] Created HybridDSR model: {vlr_size}×{vlr_size} → {config.output_size}×{config.output_size}")
+    else:
+        print(f"[load] Detected original DSR model")
+        # Instantiate original DSR model with matching config
+        config = _infer_dsr_config(state)
 
-    # Override output_size if saved in checkpoint config
-    if isinstance(ckpt, dict) and "config" in ckpt:
-        saved_config = ckpt["config"]
-        if "target_hr_size" in saved_config:
-            target_size = saved_config["target_hr_size"]
-            config.output_size = (target_size, target_size)
-            print(f"[load] Using saved target HR size: {target_size}×{target_size}")
+        # Override output_size if saved in checkpoint config
+        if isinstance(ckpt, dict) and "config" in ckpt:
+            saved_config = ckpt["config"]
+            if "target_hr_size" in saved_config:
+                target_size = saved_config["target_hr_size"]
+                config.output_size = (target_size, target_size)
+                print(f"[load] Using saved target HR size: {target_size}×{target_size}")
 
-    model = DSRColor(config=config).to(device)
+        model = DSRColor(config=config).to(device)
 
     # Clean prefixes
     cleaned = {}
@@ -152,8 +225,10 @@ def robust_load_checkpoint(path: Path, device: torch.device, vlr_size: int):
         updated[k] = v
     model.load_state_dict(updated)
     print(f"[load] matched keys: {len(matched)}, mismatched/ignored: {len(mismatches)}")
-    if mismatches:
-        print("Sample mismatches (key, ckpt_shape, model_shape):", mismatches[:8])
+    if mismatches and len(mismatches) <= 8:
+        print("Sample mismatches (key, ckpt_shape, model_shape):", mismatches)
+    elif mismatches:
+        print(f"First 8 mismatches (key, ckpt_shape, model_shape):", mismatches[:8])
     print(f"[load] Model configured for VLR input size: {vlr_size}×{vlr_size}")
     return model
 
@@ -538,19 +613,29 @@ class DSRTestGUI:
         """Load the DSR model for the current resolution."""
         try:
             model_path = MODEL_PATHS.get(self.vlr_size)
+            
+            # Check if hybrid model exists, otherwise fall back to original DSR
             if model_path is None or not model_path.exists():
-                available_models = [k for k, v in MODEL_PATHS.items() if v.exists()]
-                messagebox.showerror(
-                    "Error", 
-                    f"Model not found for {self.vlr_size}×{self.vlr_size} at {model_path}\n\n"
-                    f"Available models: {available_models if available_models else 'None'}"
-                )
-                self.status_label.config(
-                    text=f"✗ Model not found for {self.vlr_size}×{self.vlr_size}", 
-                    fg="#e74c3c"
-                )
-                self.model = None
-                return
+                fallback_path = FALLBACK_MODEL_PATHS.get(self.vlr_size)
+                if fallback_path is not None and fallback_path.exists():
+                    model_path = fallback_path
+                    print(f"Hybrid model not found, using fallback: {fallback_path}")
+                else:
+                    available_hybrid = [k for k, v in MODEL_PATHS.items() if v.exists()]
+                    available_fallback = [k for k, v in FALLBACK_MODEL_PATHS.items() if v.exists()]
+                    messagebox.showerror(
+                        "Error", 
+                        f"Model not found for {self.vlr_size}×{self.vlr_size}\n\n"
+                        f"Looked for:\n  • {MODEL_PATHS.get(self.vlr_size)}\n  • {FALLBACK_MODEL_PATHS.get(self.vlr_size)}\n\n"
+                        f"Available hybrid models: {available_hybrid if available_hybrid else 'None'}\n"
+                        f"Available fallback models: {available_fallback if available_fallback else 'None'}"
+                    )
+                    self.status_label.config(
+                        text=f"✗ Model not found for {self.vlr_size}×{self.vlr_size}", 
+                        fg="#e74c3c"
+                    )
+                    self.model = None
+                    return
 
             print(f"Loading {self.vlr_size}×{self.vlr_size} model from {model_path}...")
             self.model = robust_load_checkpoint(model_path, DEVICE, self.vlr_size)
