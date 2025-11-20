@@ -1,6 +1,6 @@
 # Low-Resolution Facial Recognition (LRFR) System
 
-End-to-end research prototype for low-resolution facial recognition with **multi-resolution support (16×16, 24×24, 32×32)**. This repository contains a complete pipeline combining custom Deep Super Resolution (DSR) models and ultra-lightweight EdgeFace embeddings for robust identity inference, with comprehensive evaluation tools suitable for research publications and real-world deployment.
+End-to-end in progress research prototype for low-resolution facial recognition with **multi-resolution support (16×16, 24×24, 32×32)**. This repository contains a complete pipeline combining custom Deep Super Resolution (DSR) models and ultra-lightweight EdgeFace embeddings for robust identity inference, with comprehensive evaluation tools suitable for research publications and real-world deployment.
 
 ---
 
@@ -342,21 +342,6 @@ result["sr_image"].save("upscaled_probe.png")
 
 ---
 
-## 🎓 Research & Publications
-
-### Citation
-
-If you use this work, please cite:
-
-```bibtex
-@misc{lrfr2025,
-  title={Low-Resolution Facial Recognition via Deep Super-Resolution and Cyclic Training},
-  author={Daniel Szurek, Brandon Nguyen},
-  year={2025},
-  note={CS565 Course Project}
-}
-```
-
 ### Related Files
 
 - **Proposal:** `Proposal/` - Initial project proposal
@@ -420,15 +405,6 @@ This project is for academic research purposes. See individual model licenses fo
 - **CMU PIE & Labeled Faces in the Wild Datasets:** Training and evaluation data
 - **PyTorch:** Deep learning framework
 - **OpenCV:** Computer vision utilities
-
----
-
-## 📧 Contact
-
-For questions or collaboration:
-
-- Open an issue on GitHub
-- Contact: [Your Email/Department]
 
 ---
 
