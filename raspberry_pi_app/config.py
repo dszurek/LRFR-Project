@@ -19,9 +19,9 @@ IS_WINDOWS = platform.system() == "Windows"
 IS_RASPBERRY_PI = platform.system() == "Linux" and platform.machine() in ["aarch64", "armv7l"]
 
 # Model paths - Use full-scale (non-quantized) models on all platforms
-DSR_MODEL_16 = PROJECT_ROOT / "technical" / "dsr" / "dsr16.pth"
-DSR_MODEL_24 = PROJECT_ROOT / "technical" / "dsr" / "dsr24.pth"
-DSR_MODEL_32 = PROJECT_ROOT / "technical" / "dsr" / "dsr32.pth"
+DSR_MODEL_16 = PROJECT_ROOT / "technical" / "dsr" / "hybrid_dsr16.pth"
+DSR_MODEL_24 = PROJECT_ROOT / "technical" / "dsr" / "hybrid_dsr24.pth"
+DSR_MODEL_32 = PROJECT_ROOT / "technical" / "dsr" / "hybrid_dsr32.pth"
 
 EDGEFACE_MODEL_16 = PROJECT_ROOT / "technical" / "facial_rec" / "edgeface_weights" / "edgeface_finetuned_16.pth"
 EDGEFACE_MODEL_24 = PROJECT_ROOT / "technical" / "facial_rec" / "edgeface_weights" / "edgeface_finetuned_24.pth"

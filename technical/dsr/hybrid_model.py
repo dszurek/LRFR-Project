@@ -539,6 +539,125 @@ def create_hybrid_dsr(vlr_size: int, target_size: int = 112) -> HybridDSR:
     return model
 
 
+
+# ==============================================================================
+# Model Loading Utilities
+# ==============================================================================
+
+def _load_checkpoint(
+    weights_path: str | Path, device: torch.device
+) -> tuple[dict[str, torch.Tensor], dict]:
+    """Return the checkpoint state dict along with raw metadata."""
+    from pathlib import Path
+    
+    weights_path = Path(weights_path)
+    if not weights_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {weights_path}")
+
+    checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
+
+    state_dict: Optional[dict[str, torch.Tensor]] = None
+    metadata: dict = {}
+
+    if isinstance(checkpoint, dict):
+        # Preserve auxiliary entries (e.g. config, epoch)
+        metadata = checkpoint
+        for key in ("model_state_dict", "state_dict"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                state_dict = value
+                break
+        if state_dict is None:
+            # Heuristic: assume tensor-only dict is already a state dict
+            tensor_items = {
+                k: v for k, v in checkpoint.items() if isinstance(v, torch.Tensor)
+            }
+            if tensor_items:
+                state_dict = tensor_items
+    elif hasattr(checkpoint, "state_dict"):
+        state_dict = checkpoint.state_dict()
+        metadata = {
+            "config": getattr(checkpoint, "config", None),
+        }
+    else:
+        raise ValueError(f"Unsupported checkpoint format at {weights_path}")
+
+    if state_dict is None:
+        raise ValueError(f"No state_dict found inside checkpoint {weights_path}")
+
+    return state_dict, metadata
+
+
+def _strip_prefixes(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    cleaned: dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        new_key = key
+        for prefix in ("model.", "module."):
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix) :]
+        cleaned[new_key] = value
+    return cleaned
+
+
+def load_dsr_model(
+    weights_path: str | Path,
+    device: torch.device | str = "cpu",
+    strict: bool = False,
+) -> HybridDSR:
+    """Instantiate and load the Hybrid DSR model on the requested device.
+    
+    Args:
+        weights_path: Path to model checkpoint
+        device: Device to load model on
+        strict: Whether to enforce strict state dict matching
+        
+    Returns:
+        Loaded HybridDSR model
+    """
+    device = torch.device(device)
+    state_dict, metadata = _load_checkpoint(weights_path, device)
+    state_dict = _strip_prefixes(state_dict)
+
+    # Try to get config from metadata
+    hybrid_config = None
+    if isinstance(metadata, dict) and "config" in metadata:
+        meta_config = metadata["config"]
+        if isinstance(meta_config, dict):
+            # Try to extract vlr_size/input_size from training config
+            vlr_size = meta_config.get("vlr_size") or meta_config.get("input_size")
+            
+            if vlr_size:
+                # Use the factory function to get correct architecture for this resolution
+                model = create_hybrid_dsr(vlr_size, target_size=112)
+                hybrid_config = model.config
+            else:
+                # Try to construct HybridDSRConfig directly from metadata
+                try:
+                    hybrid_config = HybridDSRConfig(**meta_config)
+                except Exception:
+                    hybrid_config = None
+    
+    if hybrid_config is None:
+        # Fall back to inference from state dict
+        hybrid_config = infer_hybrid_config(state_dict)
+        print("[Hybrid DSR] Warning: Could not determine input_size from metadata, using inference")
+    
+    # Create model if we don't have it yet
+    if 'model' not in locals():
+        model = HybridDSR(hybrid_config)
+    
+    missing, unexpected = model.load_state_dict(state_dict, strict=strict)
+    
+    if missing and not strict:
+        print(f"[Hybrid DSR] Warning - missing keys: {missing[:5]}..." if len(missing) > 5 else f"[Hybrid DSR] Warning - missing keys: {missing}")
+    if unexpected and not strict:
+        print(f"[Hybrid DSR] Warning - unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"[Hybrid DSR] Warning - unexpected keys: {unexpected}")
+    
+    model.to(device)
+    model.eval()
+    return model
+
+
 if __name__ == "__main__":
     # Test model creation and forward pass
     for vlr_size in [16, 24, 32]:
