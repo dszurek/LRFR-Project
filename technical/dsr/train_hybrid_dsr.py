@@ -1209,7 +1209,7 @@ def main():
     parser.add_argument(
         "--edgeface",
         type=str,
-        default="edgeface_finetuned_32.pth",
+        default="edgeface_xxs.pt",
         help="EdgeFace model filename for identity loss"
     )
     parser.add_argument(
