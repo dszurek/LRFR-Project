@@ -91,7 +91,10 @@ class HybridTrainConfig:
     # Optimization
     grad_clip: float = 1.0
     warmup_epochs: int = 5
-    early_stop_patience: int = 15
+    early_stop_patience: int = 30  # Stop if no improvement for 30 epochs
+    
+    # Data loading
+    num_workers: int = 8  # Parallel data loading for faster training
     
     # Data augmentation
     use_augmentation: bool = True
@@ -105,19 +108,19 @@ class HybridTrainConfig:
         cfg = cls(vlr_size=vlr_size)
         
         # Adjust batch size and identity weights for memory efficiency
-        # A100 OPTIMIZATION: Much larger batch sizes
+        # A100 OPTIMIZATION: Increased batch sizes for better GPU utilization
         if vlr_size <= 16:
-            cfg.batch_size = 128  # Massive batch size for A100
+            cfg.batch_size = 192  # 50% increase for better VRAM usage
             cfg.lambda_cosine = 18.0
             cfg.lambda_cosine_cross = 4.0
             cfg.lambda_feature_corr = 3.0
         elif vlr_size <= 24:
-            cfg.batch_size = 96
+            cfg.batch_size = 144  # 50% increase
             cfg.lambda_cosine = 16.0
             cfg.lambda_cosine_cross = 3.5
             cfg.lambda_feature_corr = 2.5
         else:  # 32x32
-            cfg.batch_size = 64
+            cfg.batch_size = 96  # 50% increase
             cfg.lambda_cosine = 15.0
             cfg.lambda_cosine_cross = 3.0
             cfg.lambda_feature_corr = 2.0
@@ -1228,7 +1231,7 @@ def main():
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=4,
+        default=8,
         help="Number of data loader workers"
     )
     
