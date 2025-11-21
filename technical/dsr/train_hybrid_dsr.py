@@ -94,7 +94,7 @@ class HybridTrainConfig:
     early_stop_patience: int = 30  # Stop if no improvement for 30 epochs
     
     # Data loading
-    num_workers: int = 8  # Parallel data loading for faster training
+    num_workers: int = 4  # Reduced to save system RAM
     
     # Data augmentation
     use_augmentation: bool = True
@@ -115,12 +115,14 @@ class HybridTrainConfig:
             cfg.lambda_cosine_cross = 4.0
             cfg.lambda_feature_corr = 3.0
         elif vlr_size <= 24:
-            cfg.batch_size = 144  # 50% increase
+            cfg.batch_size = 72  # Reduced from 144 (half)
+            cfg.gradient_accumulation_steps = 2  # Maintain effective batch size of 144
             cfg.lambda_cosine = 16.0
             cfg.lambda_cosine_cross = 3.5
             cfg.lambda_feature_corr = 2.5
         else:  # 32x32
-            cfg.batch_size = 96  # 50% increase
+            cfg.batch_size = 48  # Reduced from 96 (half)
+            cfg.gradient_accumulation_steps = 2  # Maintain effective batch size of 96
             cfg.lambda_cosine = 15.0
             cfg.lambda_cosine_cross = 3.0
             cfg.lambda_feature_corr = 2.0
@@ -1231,7 +1233,7 @@ def main():
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=8,
+        default=4,
         help="Number of data loader workers"
     )
     
