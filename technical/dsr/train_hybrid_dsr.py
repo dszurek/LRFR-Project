@@ -648,7 +648,8 @@ def validate_architecture_efficiency(model: nn.Module, vlr_size: int, device: to
     
     times = []
     with torch.no_grad():
-        for _ in range(100):
+        print("  Running efficiency benchmark (20 iters)...")
+        for _ in range(20):
             start = time.time()
             _ = model(dummy_input)
             if device.type == 'cuda':
@@ -1237,10 +1238,21 @@ def main():
         help="Number of data loader workers"
     )
     
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Number of training epochs (overrides config default)"
+    )
+    
     args = parser.parse_args()
     
     # Create config for specified resolution
     config = HybridTrainConfig.for_resolution(args.vlr_size)
+    
+    # Override epochs if specified
+    if args.epochs:
+        config.epochs = args.epochs
     
     # Start training
     train(config, args)

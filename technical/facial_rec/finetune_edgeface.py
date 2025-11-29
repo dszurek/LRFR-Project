@@ -715,6 +715,8 @@ def main(args: argparse.Namespace) -> None:
     config = FinetuneConfig.make(args.vlr_size)
     if args.stage2_epochs:
         config.stage2_epochs = args.stage2_epochs
+    if args.stage1_epochs:
+        config.stage1_epochs = args.stage1_epochs
 
     device = torch.device(args.device)
     set_random_seed(config.seed)
@@ -1079,6 +1081,12 @@ def parse_args() -> argparse.Namespace:
         "--use-small-gallery",
         action="store_true",
         help="Use frontal_only dataset (recommended for 1:1 and small 1:N matching scenarios)",
+    )
+    parser.add_argument(
+        "--stage1-epochs",
+        type=int,
+        default=None,
+        help="Override number of stage 1 epochs (default: varies by resolution)",
     )
     return parser.parse_args()
 
