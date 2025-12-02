@@ -5,10 +5,6 @@ __pycache__/
 *.so
 .DS_Store
 .ipynb_checkpoints/
-# Ignore large model weights (saved to Drive instead)
-technical/dsr/*.pth
 technical/facial_rec/edgeface_weights/*.pth
-!technical/facial_rec/edgeface_weights/edgeface_xxs.pt
-!technical/facial_rec/edgeface_weights/edgeface_s_gamma_05.pt
 evaluation_results/
 dataset.zip
