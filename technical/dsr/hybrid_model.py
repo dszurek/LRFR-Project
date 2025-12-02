@@ -653,6 +653,8 @@ def load_dsr_model(
     if unexpected and not strict:
         print(f"[Hybrid DSR] Warning - unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"[Hybrid DSR] Warning - unexpected keys: {unexpected}")
     
+    print(f"[Hybrid DSR] Successfully loaded weights from {weights_path}")
+    
     model.to(device)
     model.eval()
     return model

@@ -21,26 +21,27 @@ if str(ROOT) not in sys.path:
 
 # Import the canonical model
 try:
-    from technical.dsr.models import (
+    from technical.dsr.archive.models import (
         DSRColor,
         DSRConfig,
     )
     from technical.dsr.hybrid_model import (
         HybridDSR,
         HybridDSRConfig,
+        load_dsr_model,
     )
 except Exception:
     # fallback: try package relative import (if you run as module this won't be used)
-    from .models import DSRColor, DSRConfig  # type: ignore
-    from .hybrid_model import HybridDSR, HybridDSRConfig  # type: ignore
+    from .archive.models import DSRColor, DSRConfig  # type: ignore
+    from .hybrid_model import HybridDSR, HybridDSRConfig, load_dsr_model  # type: ignore
 
 # ---------- Config ----------
 # DSR model checkpoints for different resolutions
 # Try hybrid models first, fall back to original DSR if not found
 MODEL_PATHS = {
-    16: Path(__file__).resolve().parent / "hybrid_dsr16.pth",
-    24: Path(__file__).resolve().parent / "hybrid_dsr24.pth",
-    32: Path(__file__).resolve().parent / "hybrid_dsr32.pth",
+    16: ROOT / "technical" / "dsr" / "hybrid_dsr16.pth",
+    24: ROOT / "technical" / "dsr" / "hybrid_dsr24.pth",
+    32: ROOT / "technical" / "dsr" / "hybrid_dsr32.pth",
 }
 # Fallback to old DSR models if hybrid models don't exist
 FALLBACK_MODEL_PATHS = {
@@ -84,153 +85,6 @@ def find_hr_dir() -> Optional[Path]:
         if p.exists():
             return p
     return None
-
-
-def _infer_dsr_config(state: dict[str, torch.Tensor]) -> DSRConfig:
-    """Infer DSRConfig fields directly from checkpoint tensor shapes."""
-
-    base_channels = 64
-    if "conv_in.weight" in state and isinstance(state["conv_in.weight"], torch.Tensor):
-        base_channels = state["conv_in.weight"].shape[0]
-
-    residual_block_indices = set()
-    for key in state:
-        if key.startswith("residual_blocks"):
-            parts = key.split(".")
-            if len(parts) > 1 and parts[1].isdigit():
-                residual_block_indices.add(int(parts[1]))
-
-    residual_blocks = max(residual_block_indices) + 1 if residual_block_indices else 8
-
-    return DSRConfig(base_channels=base_channels, residual_blocks=residual_blocks)
-
-
-def robust_load_checkpoint(path: Path, device: torch.device, vlr_size: int):
-    """Load checkpoint at `path`, build model using inferred config, and load matching params."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-
-    # Extract state dict
-    if isinstance(ckpt, dict):
-        if "state_dict" in ckpt:
-            state = ckpt["state_dict"]
-        elif "model_state_dict" in ckpt:
-            state = ckpt["model_state_dict"]
-        else:
-            state = ckpt
-    else:
-        if hasattr(ckpt, "state_dict"):
-            state = ckpt.state_dict()
-        else:
-            raise RuntimeError(f"Unsupported checkpoint object: {type(ckpt)}")
-
-    # Detect if this is a hybrid model (has transformer attention blocks)
-    is_hybrid = any("attention" in k or "norm" in k for k in state.keys())
-    
-    if is_hybrid:
-        print(f"[load] Detected hybrid DSR model")
-        
-        # Infer architecture from state dict shapes
-        base_channels = 64  # default
-        if "shallow_feat.weight" in state:
-            base_channels = state["shallow_feat.weight"].shape[0]
-        
-        # Count residual blocks
-        res_block_indices = set()
-        for key in state.keys():
-            if key.startswith("res_blocks."):
-                parts = key.split(".")
-                if len(parts) > 1 and parts[1].isdigit():
-                    res_block_indices.add(int(parts[1]))
-        num_residual_blocks = len(res_block_indices) if res_block_indices else 8
-        
-        # Count transformer blocks
-        transformer_indices = set()
-        for key in state.keys():
-            if key.startswith("transformer_blocks."):
-                parts = key.split(".")
-                if len(parts) > 1 and parts[1].isdigit():
-                    transformer_indices.add(int(parts[1]))
-        num_transformer_blocks = len(transformer_indices) if transformer_indices else 2
-        
-        # Get transformer dim
-        transformer_dim = 256  # default
-        if "to_transformer.weight" in state:
-            transformer_dim = state["to_transformer.weight"].shape[0]
-        
-        # Get output size from config if available
-        output_size = 112
-        if isinstance(ckpt, dict) and "config" in ckpt:
-            cfg = ckpt["config"]
-            if "target_hr_size" in cfg:
-                output_size = cfg["target_hr_size"]
-            elif "hr_size" in cfg:
-                output_size = cfg["hr_size"]
-            elif "output_size" in cfg:
-                output_size = cfg["output_size"]
-        
-        config = HybridDSRConfig(
-            input_size=vlr_size,
-            output_size=output_size,
-            base_channels=base_channels,
-            num_residual_blocks=num_residual_blocks,
-            num_transformer_blocks=num_transformer_blocks,
-            transformer_dim=transformer_dim,
-        )
-        
-        print(f"[load] Inferred config: base_channels={base_channels}, "
-              f"residual_blocks={num_residual_blocks}, transformer_blocks={num_transformer_blocks}")
-        
-        model = HybridDSR(config).to(device)
-        print(f"[load] Created HybridDSR model: {vlr_size}×{vlr_size} → {config.output_size}×{config.output_size}")
-    else:
-        print(f"[load] Detected original DSR model")
-        # Instantiate original DSR model with matching config
-        config = _infer_dsr_config(state)
-
-        # Override output_size if saved in checkpoint config
-        if isinstance(ckpt, dict) and "config" in ckpt:
-            saved_config = ckpt["config"]
-            if "target_hr_size" in saved_config:
-                target_size = saved_config["target_hr_size"]
-                config.output_size = (target_size, target_size)
-                print(f"[load] Using saved target HR size: {target_size}×{target_size}")
-
-        model = DSRColor(config=config).to(device)
-
-    # Clean prefixes
-    cleaned = {}
-    for k, v in state.items():
-        nk = k
-        for p in ("module.", "model."):
-            if nk.startswith(p):
-                nk = nk[len(p) :]
-        cleaned[nk] = v
-
-    # Match shapes and only copy compatible tensors
-    model_state = model.state_dict()
-    matched = {}
-    mismatches = []
-    for k, v in cleaned.items():
-        if k in model_state:
-            if isinstance(v, torch.Tensor) and v.shape == model_state[k].shape:
-                matched[k] = v
-            else:
-                mismatches.append((k, getattr(v, "shape", None), model_state[k].shape))
-        else:
-            mismatches.append((k, getattr(v, "shape", None), None))
-
-    # Update and load
-    updated = {**model_state}
-    for k, v in matched.items():
-        updated[k] = v
-    model.load_state_dict(updated)
-    print(f"[load] matched keys: {len(matched)}, mismatched/ignored: {len(mismatches)}")
-    if mismatches and len(mismatches) <= 8:
-        print("Sample mismatches (key, ckpt_shape, model_shape):", mismatches)
-    elif mismatches:
-        print(f"First 8 mismatches (key, ckpt_shape, model_shape):", mismatches[:8])
-    print(f"[load] Model configured for VLR input size: {vlr_size}×{vlr_size}")
-    return model
 
 
 def detect_and_crop_face(
@@ -638,7 +492,8 @@ class DSRTestGUI:
                     return
 
             print(f"Loading {self.vlr_size}×{self.vlr_size} model from {model_path}...")
-            self.model = robust_load_checkpoint(model_path, DEVICE, self.vlr_size)
+            # Use the shared loading utility
+            self.model = load_dsr_model(model_path, DEVICE)
             self.model.eval()
             print("Model loaded successfully.")
             

@@ -1,39 +1,42 @@
 """
 LFW Low-Resolution Face Recognition Evaluation
 
-Reproduces EXACT evaluation from:
+Reproduces evaluation methodology from:
 Lai et al. (2019) - "Low-Resolution Face Recognition Based on Identity-Preserved Face Hallucination"
 
-Tables reproduced:
-- Table 1: Verification rates (%) on LFW 6,000 pairs at resolutions 7×6, 14×12, 16×16, 18×16, 28×24, 112×96
-- Table 2: Rank-1 identification rates (%) at same resolutions
+Metrics:
+1. Image Quality: PSNR, SSIM
+2. Verification: Accuracy, VR@FAR (0.1%, 1%), Similarity Stats
+3. Identification: Rank-1, Rank-5, Rank-10, Rank-20
 
-Protocol:
-- Dataset: LFW faces from frontal_only directory
-- Verification: 6,000 pairs (3,000 genuine + 3,000 impostor)
-- Identification: Closed-set, 1 gallery per subject, rest as probes
-- No open-set scenario, small gallery matching paper
+Comparisons:
+- Resolutions: 16x16, 24x24, 32x32, 112x112 (HR)
+- Upscaling: Bicubic vs DSR (HybridDSR)
+- Recognition: Default EdgeFace vs Finetuned EdgeFace
 """
 
 import os
 import sys
 import json
+import math
 import numpy as np
 import torch
 import torch.nn as nn
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from sklearn.metrics import roc_curve, auc
 import random
+from skimage.metrics import structural_similarity as ssim_func
 
 # Add project root to path
-project_root = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(project_root / "technical"))
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
-from pipeline import build_pipeline, PipelineConfig
+from technical.pipeline.pipeline import build_pipeline, PipelineConfig
 from PIL import Image
 from torchvision import transforms
 
@@ -58,7 +61,7 @@ class LFWEvaluator:
         self.output_dir = output_dir
         self.device = device
         
-        # Resolutions to test (H, W) - matching our trained models
+        # Resolutions to test (H, W)
         self.resolutions = [
             (16, 16),    # 16x16 VLR
             (24, 24),    # 24x24 VLR
@@ -66,86 +69,66 @@ class LFWEvaluator:
             (112, 112)   # HR resolution
         ]
         
-        # Create pipelines for each resolution
-        print("Loading pipelines...")
-        self.pipelines = {}  # resolution -> (dsr_pipeline, base_pipeline)
-        
         # Create output directory
         output_dir.mkdir(parents=True, exist_ok=True)
         
         print(f"Device: {device}")
         print(f"Dataset directory: {dataset_dir}")
         print(f"Output directory: {output_dir}")
-    
-    def _build_pipelines_for_resolution(self, resolution: Tuple[int, int]):
-        """Build DSR and bicubic pipelines for a specific resolution"""
-        if resolution == (112, 112):
-            # HR baseline - no DSR needed, just use base EdgeFace
-            base_config = PipelineConfig(
-                dsr_weights_path=self.dsr_dir / "dsr32.pth",  # Dummy, won't be used
-                edgeface_weights_path=self.edgeface_dir / "edgeface_xxs.pt",
-                device=self.device,
-                skip_dsr=True  # Skip DSR for HR
-            )
-            return None, build_pipeline(base_config)  # No DSR pipeline for HR
         
+        self.pipelines = {} # (res, method) -> pipeline
+
+    def _get_pipeline(self, resolution: Tuple[int, int], use_dsr: bool, use_finetuned: bool) -> Any:
+        """Build or retrieve a pipeline for a specific configuration"""
+        key = (resolution, use_dsr, use_finetuned)
+        if key in self.pipelines:
+            return self.pipelines[key]
+            
+        res_val = resolution[0]
+        
+        # Determine weights
+        if use_finetuned and resolution != (112, 112):
+            edgeface_path = self.edgeface_dir / f"edgeface_finetuned_{res_val}.pth"
         else:
-            res_key = resolution[0]  # 16, 24, or 32
+            edgeface_path = self.edgeface_dir / "edgeface_xxs.pt"
             
-            # DSR pipeline with finetuned EdgeFace
-            # NOTE: Using finetuned model trained on LFW - this is task-specific evaluation, not generalization
-            dsr_config = PipelineConfig(
-                dsr_weights_path=self.dsr_dir / f"dsr{res_key}.pth",
-                edgeface_weights_path=self.edgeface_dir / f"edgeface_finetuned_{res_key}.pth",
-                device=self.device,
-                skip_dsr=False
-            )
-            dsr_pipeline = build_pipeline(dsr_config)
+        dsr_path = self.dsr_dir / f"hybrid_dsr{res_val}.pth"
+        
+        # Config
+        config = PipelineConfig(
+            dsr_weights_path=dsr_path,
+            edgeface_weights_path=edgeface_path,
+            device=self.device,
+            skip_dsr=not use_dsr
+        )
+        
+        # For HR, we always skip DSR
+        if resolution == (112, 112):
+            config.skip_dsr = True
             
-            # Bicubic pipeline with SAME finetuned EdgeFace
-            bicubic_config = PipelineConfig(
-                dsr_weights_path=self.dsr_dir / f"dsr{res_key}.pth",  # Dummy, won't be used
-                edgeface_weights_path=self.edgeface_dir / f"edgeface_finetuned_{res_key}.pth",
-                device=self.device,
-                skip_dsr=True  # Skip DSR for bicubic baseline
-            )
-            bicubic_pipeline = build_pipeline(bicubic_config)
-            
-            return dsr_pipeline, bicubic_pipeline
-    
+        pipeline = build_pipeline(config)
+        self.pipelines[key] = pipeline
+        return pipeline
+
     def _get_embedding_from_image(
         self,
         img_path: Path,
         pipeline
     ) -> np.ndarray:
-        """
-        Get embedding from image using Pipeline
-        
-        The pipeline's skip_dsr flag determines the processing path:
-        - skip_dsr=False: Use DSR upscaling (for DSR pipelines)
-        - skip_dsr=True: Manual bicubic upscaling (for bicubic/HR pipelines)
-        
-        Args:
-            img_path: Path to VLR or HR image
-            pipeline: FaceRecognitionPipeline instance (already configured for DSR or bicubic)
-        
-        Returns:
-            Embedding as 1D numpy array (L2-normalized)
-        """
+        """Get embedding from image using Pipeline"""
         if not pipeline.config.skip_dsr:
             # DSR pipeline: upscale VLR -> extract embedding from SR
             sr_tensor = pipeline.upscale(img_path)
             embedding = pipeline.infer_embedding(sr_tensor)
         else:
             # Bicubic/HR: load image directly and extract embedding
-            # For VLR images with bicubic, we need to manually upscale
             img = Image.open(img_path).convert('RGB')
             
             if img.size != (112, 112):
                 # Bicubic upscale to 112x112
                 img = img.resize((112, 112), Image.Resampling.BICUBIC)
             
-            # Convert to tensor for EdgeFace (normalization will be applied by infer_embedding)
+            # Convert to tensor for EdgeFace
             transform = transforms.Compose([
                 transforms.ToTensor(),
             ])
@@ -160,151 +143,171 @@ class LFWEvaluator:
         return embedding
     
     def load_lfw_subjects(self, resolution: Tuple[int, int]) -> Dict[str, List[Path]]:
-        """
-        Load LFW subjects from pre-existing VLR/HR directories
-        Follows paper methodology: use subjects with ≥4 images
-        
-        LFW images have format: 1001_0001_lfw.png where 1001 is subject ID
-        
-        Args:
-            resolution: (H, W) resolution to load
-            
-        Returns:
-            Dictionary mapping subject_id -> list of image paths from appropriate VLR/HR directory
-        """
+        """Load LFW subjects from pre-existing VLR/HR directories"""
         subjects = {}
         
-        # Determine which directory to load from based on resolution
-        # Use frontal_only/test for evaluation (frontal faces, same images at different resolutions)
         if resolution == (112, 112):
-            # HR baseline - load from hr_images
-            image_dir = self.dataset_dir / "frontal_only" / "test" / "hr_images"
+            image_dir = self.dataset_dir / "test_processed" / "hr_images"
         elif resolution == (16, 16):
-            # VLR 16×16
-            image_dir = self.dataset_dir / "frontal_only" / "test" / "vlr_images_16x16"
+            image_dir = self.dataset_dir / "test_processed" / "vlr_images_16x16"
         elif resolution == (24, 24):
-            # VLR 24×24
-            image_dir = self.dataset_dir / "frontal_only" / "test" / "vlr_images_24x24"
+            image_dir = self.dataset_dir / "test_processed" / "vlr_images_24x24"
         elif resolution == (32, 32):
-            # VLR 32×32
-            image_dir = self.dataset_dir / "frontal_only" / "test" / "vlr_images_32x32"
+            image_dir = self.dataset_dir / "test_processed" / "vlr_images_32x32"
         else:
             raise ValueError(f"Unsupported resolution: {resolution}")
         
-        # Load images from test directory
         if not image_dir.exists():
-            raise FileNotFoundError(f"Directory not found: {image_dir}")
+            # Fallback to generic vlr_images if specific doesn't exist
+            if resolution != (112, 112):
+                 image_dir = self.dataset_dir / "test_processed" / "vlr_images"
+            
+            if not image_dir.exists():
+                raise FileNotFoundError(f"Directory not found: {image_dir}")
         
         for img_path in sorted(image_dir.glob("*.png")):
-            # Extract subject ID from filename
-            # Format: 007_01_01_041_00_crop_128.png -> subject_id is first part (007)
-            filename = img_path.stem  # Remove .png
+            filename = img_path.stem
             subject_id = filename.split('_')[0]
             
             if subject_id not in subjects:
                 subjects[subject_id] = []
             subjects[subject_id].append(img_path)
         
-        # Filter to subjects with at least 4 images (matching paper methodology)
+        # Filter to subjects with at least 4 images
         subjects = {sid: imgs for sid, imgs in subjects.items() if len(imgs) >= 4}
         
-        print(f"\nLoaded {len(subjects)} LFW subjects from {resolution[0]}x{resolution[1]} directories")
-        print(f"  Subjects with >=4 images: {len(subjects)}")
-        print(f"  Total images: {sum(len(imgs) for imgs in subjects.values())}")
-        
+        print(f"Loaded {len(subjects)} LFW subjects from {image_dir}")
         return subjects
-    
-    def evaluate_verification_at_resolution(
+
+    def calculate_image_metrics(self, img1: np.ndarray, img2: np.ndarray) -> Tuple[float, float]:
+        """Calculate PSNR and SSIM between two images (H, W, C) range [0, 255]"""
+        # PSNR
+        mse = np.mean((img1 - img2) ** 2)
+        if mse == 0:
+            psnr = 100
+        else:
+            psnr = 20 * math.log10(255.0 / math.sqrt(mse))
+            
+        # SSIM
+        # win_size must be odd and <= min(H, W). Images are 112x112, so 7 is safe.
+        ssim = ssim_func(img1, img2, channel_axis=2, data_range=255, win_size=3)
+        
+        return psnr, ssim
+
+    def evaluate_image_quality(
         self,
         subjects: Dict[str, List[Path]],
-        resolution: Tuple[int, int],
-        use_dsr: bool = True
-    ) -> Dict:
-        """
-        Evaluate face verification at given resolution
+        pipeline,
+        hr_subjects: Dict[str, List[Path]
+    ]) -> Dict:
+        """Evaluate PSNR and SSIM against HR ground truth"""
+        psnr_list = []
+        ssim_list = []
         
-        Following LFW protocol: 6,000 pairs (3,000 same + 3,000 different)
+        # We need to compare VLR->SR against HR
+        # Iterate through subjects that exist in both
+        common_subjects = set(subjects.keys()) & set(hr_subjects.keys())
         
-        Args:
-            subjects: Dictionary of subject_id -> image paths (from VLR/HR directories)
-            resolution: (H, W) probe resolution
-            use_dsr: If True, use DSR pipeline; else use bicubic pipeline
+        # Sample max 500 images to save time
+        sample_count = 0
+        max_samples = 500
+        
+        for subject_id in common_subjects:
+            vlr_paths = subjects[subject_id]
+            hr_paths = hr_subjects[subject_id]
             
-        Returns:
-            Dictionary with verification metrics
-        """
-        # Get appropriate pipeline
-        if resolution == (112, 112):
-            # HR baseline - use base EdgeFace, no DSR
-            _, pipeline = self.pipelines[resolution]
-        else:
-            # VLR - use DSR or bicubic pipeline
-            dsr_pipeline, bicubic_pipeline = self.pipelines[resolution]
-            pipeline = dsr_pipeline if use_dsr else bicubic_pipeline
-        
-        # Generate pairs following LFW protocol: 3,000 genuine + 3,000 impostor
+            # Assuming filenames match (or are aligned by sort order)
+            # LFW format: {id}_{name}_{num}.png. 
+            # We'll try to match by filename suffix if possible, or just index
+            
+            min_len = min(len(vlr_paths), len(hr_paths))
+            for i in range(min_len):
+                if sample_count >= max_samples:
+                    break
+                
+                vlr_path = vlr_paths[i]
+                hr_path = hr_paths[i]
+                
+                # Get SR image (numpy 0-255)
+                if not pipeline.config.skip_dsr:
+                    sr_tensor = pipeline.upscale(vlr_path) # (1, 3, H, W)
+                    sr_img = sr_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0
+                else:
+                    # Bicubic upscale
+                    img = Image.open(vlr_path).convert('RGB')
+                    img = img.resize((112, 112), Image.Resampling.BICUBIC)
+                    sr_img = np.array(img).astype(float)
+                
+                # Get HR image
+                hr_img = np.array(Image.open(hr_path).convert('RGB')).astype(float)
+                
+                # Ensure sizes match (HR might be different if not resized)
+                if hr_img.shape != (112, 112, 3):
+                     hr_img = np.array(Image.open(hr_path).convert('RGB').resize((112, 112))).astype(float)
+                
+                # Calculate metrics
+                psnr, ssim = self.calculate_image_metrics(sr_img, hr_img)
+                psnr_list.append(psnr)
+                ssim_list.append(ssim)
+                
+                sample_count += 1
+            
+            if sample_count >= max_samples:
+                break
+                
+        return {
+            'psnr': float(np.mean(psnr_list)) if psnr_list else 0.0,
+            'ssim': float(np.mean(ssim_list)) if ssim_list else 0.0
+        }
+    
+    def evaluate_verification(
+        self,
+        subjects: Dict[str, List[Path]],
+        pipeline
+    ) -> Dict:
+        """Evaluate face verification (1:1)"""
         positive_pairs = []
         negative_pairs = []
-        
         subject_ids = list(subjects.keys())
-        random.seed(42)  # For reproducibility
+        random.seed(42)
         
-        # Positive pairs (same subject) - generate 3,000 pairs
-        target_positive = 3000
-        while len(positive_pairs) < target_positive:
-            # Sample random subject
+        # Positive pairs (3000)
+        while len(positive_pairs) < 3000:
             subject_id = random.choice(subject_ids)
             img_paths = subjects[subject_id]
-            
             if len(img_paths) >= 2:
-                # Sample two different images from same subject
                 img1, img2 = random.sample(img_paths, 2)
                 positive_pairs.append((img1, img2, 1))
         
-        # Negative pairs (different subjects) - generate 3,000 pairs
-        target_negative = 3000
-        while len(negative_pairs) < target_negative:
-            # Sample two different subjects
+        # Negative pairs (3000)
+        while len(negative_pairs) < 3000:
             sid1, sid2 = random.sample(subject_ids, 2)
             img1 = random.choice(subjects[sid1])
             img2 = random.choice(subjects[sid2])
             negative_pairs.append((img1, img2, 0))
         
-        # Combine to get exactly 6,000 pairs
         all_pairs = positive_pairs + negative_pairs
         
-        print(f"  Generated {len(all_pairs)} pairs ({len(positive_pairs)} pos, {len(negative_pairs)} neg)")
-        
-        # Evaluate pairs using Pipeline
         similarities = []
         labels = []
         
-        for img1_path, img2_path, label in tqdm(all_pairs, desc=f"  Verifying at {resolution[0]}×{resolution[1]}"):
-            # Get embeddings using Pipeline (pipeline already configured for DSR or bicubic)
+        for img1_path, img2_path, label in tqdm(all_pairs, desc="Verifying", leave=False):
             emb1 = self._get_embedding_from_image(img1_path, pipeline)
             emb2 = self._get_embedding_from_image(img2_path, pipeline)
-            
-            # Compute cosine similarity (embeddings are already L2-normalized by pipeline)
-            # For normalized vectors: cosine_sim = dot(a, b) / (||a|| * ||b||) = dot(a, b) / (1 * 1) = dot(a, b)
-            sim = np.dot(emb1, emb2).item() if hasattr(np.dot(emb1, emb2), 'item') else float(np.dot(emb1, emb2))
-            
+            sim = np.dot(emb1, emb2).item()
             similarities.append(sim)
             labels.append(label)
         
-        # Compute metrics
         similarities = np.array(similarities)
         labels = np.array(labels)
         
-        # Sanity check: print similarity statistics
-        genuine_sims = similarities[labels == 1]
-        impostor_sims = similarities[labels == 0]
-        print(f"    Similarity stats - Genuine: mean={genuine_sims.mean():.3f}, std={genuine_sims.std():.3f}, range=[{genuine_sims.min():.3f}, {genuine_sims.max():.3f}]")
-        print(f"    Similarity stats - Impostor: mean={impostor_sims.mean():.3f}, std={impostor_sims.std():.3f}, range=[{impostor_sims.min():.3f}, {impostor_sims.max():.3f}]")
+        # Stats
+        gen_sims = similarities[labels == 1]
+        imp_sims = similarities[labels == 0]
         
-        # Find optimal threshold for accuracy (standard LFW protocol)
+        # Find optimal threshold
         best_acc = 0
         best_threshold = 0
-        
         for threshold in np.linspace(0, 1, 1000):
             predictions = (similarities >= threshold).astype(int)
             acc = np.mean(predictions == labels)
@@ -321,344 +324,416 @@ class LFWEvaluator:
         eer_idx = np.nanargmin(np.abs(fnr - fpr))
         eer = (fpr[eer_idx] + fnr[eer_idx]) / 2
         
+        # VR @ FAR
+        # Find TPR where FPR <= target
+        def get_vr_at_far(target_far):
+            # Ensure fpr is sorted and unique for interpolation
+            unique_fpr, unique_tpr = np.unique(fpr, return_index=True), np.unique(tpr, return_index=True)
+            
+            # Find the index where FPR is closest to target_far from below
+            idx = np.where(fpr <= target_far)[0]
+            if len(idx) == 0:
+                return 0.0 # No FPR below target
+            
+            # Get the highest TPR for FPR <= target_far
+            return tpr[idx[-1]]
+            
+        vr_far_01 = get_vr_at_far(0.001) # 0.1%
+        vr_far_1 = get_vr_at_far(0.01)   # 1%
+        
         return {
-            'resolution': f"{resolution[0]}×{resolution[1]}",
-            'accuracy': float(best_acc * 100),  # Best achievable accuracy (standard LFW protocol)
+            'accuracy': float(best_acc * 100),
             'threshold': float(best_threshold),
             'roc_auc': float(roc_auc),
-            'eer': float(eer * 100),  # Convert to percentage
-            'fpr': fpr.tolist(),
-            'tpr': tpr.tolist()
+            'eer': float(eer * 100),
+            'vr_far_01': float(vr_far_01 * 100),
+            'vr_far_1': float(vr_far_1 * 100),
+            'gen_mean': float(np.mean(gen_sims)),
+            'gen_std': float(np.std(gen_sims)),
+            'imp_mean': float(np.mean(imp_sims)),
+            'imp_std': float(np.std(imp_sims)),
+            # Return raw data for plotting (will be excluded from JSON dump if not serializable, but okay for internal use)
+            'fpr': fpr,
+            'tpr': tpr,
+            'gen_sims': gen_sims,
+            'imp_sims': imp_sims
         }
     
-    def evaluate_identification_at_resolution(
+    def evaluate_identification(
         self,
         subjects: Dict[str, List[Path]],
-        resolution: Tuple[int, int],
-        use_dsr: bool = True
+        pipeline
     ) -> Dict:
-        """
-        Evaluate face identification at given resolution
-        
-        Closed-set protocol: 1 gallery image per subject, rest as probes
-        
-        Args:
-            subjects: Dictionary of subject_id -> image paths (from VLR/HR directories)
-            resolution: (H, W) probe resolution
-            use_dsr: If True, use DSR pipeline; else use bicubic pipeline
-            
-        Returns:
-            Dictionary with identification metrics (rank-1, rank-5, rank-10)
-        """
-        # Get appropriate pipeline
-        if resolution == (112, 112):
-            # HR baseline - use base EdgeFace, no DSR
-            _, pipeline = self.pipelines[resolution]
-        else:
-            # VLR - use DSR or bicubic pipeline
-            dsr_pipeline, bicubic_pipeline = self.pipelines[resolution]
-            pipeline = dsr_pipeline if use_dsr else bicubic_pipeline
-        
+        """Evaluate identification (1:N)"""
         # Build gallery (first image of each subject)
         gallery = []
         gallery_features = []
         
-        print(f"  Building gallery at {resolution[0]}×{resolution[1]}...")
-        for subject_id, img_paths in tqdm(subjects.items(), desc="  Gallery"):
-            # Get embedding using Pipeline
+        for subject_id, img_paths in tqdm(subjects.items(), desc="Gallery", leave=False):
             emb = self._get_embedding_from_image(img_paths[0], pipeline)
-            
             gallery.append({'subject_id': subject_id, 'features': emb})
             gallery_features.append(emb)
         
-        gallery_features = np.array(gallery_features)  # (N_gallery, D)
+        gallery_features = np.array(gallery_features)
         
-        # Build probe set (remaining images)
+        # Probes
         probes = []
         for subject_id, img_paths in subjects.items():
-            for img_path in img_paths[1:]:  # Skip first (in gallery)
+            for img_path in img_paths[1:]:
                 probes.append({'subject_id': subject_id, 'img_path': img_path})
         
-        print(f"  Gallery: {len(gallery)} subjects")
-        print(f"  Probes: {len(probes)} images")
-        
-        # Evaluate probes
         ranks = []
         
-        for probe in tqdm(probes, desc=f"  Identifying at {resolution[0]}×{resolution[1]}"):
-            # Get embedding using Pipeline
+        for probe in tqdm(probes, desc="Identifying", leave=False):
             emb_probe = self._get_embedding_from_image(probe['img_path'], pipeline)
             
-            # Compute similarities with all gallery (cosine similarity)
-            similarities = []
-            for emb_gallery in gallery_features:
-                sim = np.dot(emb_probe, emb_gallery) / (np.linalg.norm(emb_probe) * np.linalg.norm(emb_gallery))
-                similarities.append(sim)
+            # Cosine similarity
+            sims = np.dot(gallery_features, emb_probe) / (np.linalg.norm(gallery_features, axis=1) * np.linalg.norm(emb_probe))
             
-            # Rank gallery by similarity
-            ranked_indices = np.argsort(similarities)[::-1]  # Descending
-            
-            # Find rank of correct subject
+            # Rank
+            sorted_indices = np.argsort(sims)[::-1]
             true_subject = probe['subject_id']
+            
             rank = None
-            for r, idx in enumerate(ranked_indices, 1):
+            for r, idx in enumerate(sorted_indices, 1):
                 if gallery[idx]['subject_id'] == true_subject:
                     rank = r
                     break
             
             if rank is None:
-                rank = len(gallery) + 1  # Not found
+                rank = len(gallery) + 1
             
             ranks.append(rank)
         
-        # Compute rank-k accuracies
         ranks = np.array(ranks)
-        rank1 = np.mean(ranks <= 1) * 100
-        rank5 = np.mean(ranks <= 5) * 100
-        rank10 = np.mean(ranks <= 10) * 100
-        
         return {
-            'resolution': f"{resolution[0]}×{resolution[1]}",
-            'rank1': float(rank1),
-            'rank5': float(rank5),
-            'rank10': float(rank10),
-            'ranks': ranks.tolist()
+            'rank1': float(np.mean(ranks <= 1) * 100),
+            'rank5': float(np.mean(ranks <= 5) * 100),
+            'rank10': float(np.mean(ranks <= 10) * 100),
+            'rank20': float(np.mean(ranks <= 20) * 100),
+            'ranks': ranks # Return raw ranks for CMC plot
         }
-    
-    def run_evaluation(self) -> Dict:
-        """
-        Run full evaluation matching Lai et al. 2019
-        
-        Returns:
-            Dictionary with all results for Table 1 and Table 2
-        """
-        print("\n" + "="*80)
-        print("LFW EVALUATION - Matching Lai et al. 2019")
-        print("="*80)
-        
-        # Load LFW subjects for EACH resolution from appropriate VLR/HR directories
-        print("\nLoading LFW subjects from VLR/HR directories...")
-        subjects = {}
-        for res in [(16, 16), (24, 24), (32, 32), (112, 112)]:
-            subjects[res] = self.load_lfw_subjects(res)
-        
-        results = {
-            'table1_verification': {},
-            'table2_identification': {}
-        }
-        
-        # Build pipelines for each resolution
-        print("\nBuilding pipelines for each resolution...")
-        for resolution in self.resolutions:
-            print(f"  Resolution {resolution[0]}×{resolution[1]}...")
-            self.pipelines[resolution] = self._build_pipelines_for_resolution(resolution)
-        
-        print(f"\nBuilt {len(self.pipelines)} pipeline sets")
-        
-        # Table 1: Verification with bicubic and DSR
-        print("\n" + "="*80)
-        print("TABLE 1: VERIFICATION RATES")
-        print("="*80)
-        
-        for resolution in self.resolutions:
-            print(f"\nResolution: {resolution[0]}×{resolution[1]}")
-            
-            # Get subjects for THIS resolution
-            res_subjects = subjects[resolution]
-            
-            if resolution == (112, 112):
-                # HR baseline - only evaluate once (no upscaling needed)
-                print("  Method: HR Baseline (no upscaling)")
-                hr_result = self.evaluate_verification_at_resolution(
-                    res_subjects, resolution, use_dsr=False
-                )
-                results['table1_verification'][f"{resolution[0]}x{resolution[1]}"] = {
-                    'bicubic': hr_result,
-                    'dsr': hr_result
-                }
-                print(f"  Accuracy: {hr_result['accuracy']:.2f}%")
-            else:
-                # VLR - compare bicubic vs DSR
-                print("  Method: Bicubic")
-                bicubic_result = self.evaluate_verification_at_resolution(
-                    res_subjects, resolution, use_dsr=False
-                )
-                
-                print("  Method: DSR")
-                dsr_result = self.evaluate_verification_at_resolution(
-                    res_subjects, resolution, use_dsr=True
-                )
-                
-                results['table1_verification'][f"{resolution[0]}x{resolution[1]}"] = {
-                    'bicubic': bicubic_result,
-                    'dsr': dsr_result
-                }
-                
-                print(f"  Bicubic Accuracy: {bicubic_result['accuracy']:.2f}% (threshold: {bicubic_result['threshold']:.3f})")
-                print(f"  DSR Accuracy: {dsr_result['accuracy']:.2f}% (threshold: {dsr_result['threshold']:.3f})")
-        
-        # Table 2: Identification (closed-set)
-        print("\n" + "="*80)
-        print("TABLE 2: RANK-1 IDENTIFICATION RATES")
-        print("="*80)
-        
-        for resolution in self.resolutions:
-            print(f"\nResolution: {resolution[0]}×{resolution[1]}")
-            
-            # Get subjects for THIS resolution
-            res_subjects = subjects[resolution]
-            
-            if resolution == (112, 112):
-                # HR baseline - only evaluate once (no upscaling needed)
-                print("  Method: HR Baseline (no upscaling)")
-                hr_result = self.evaluate_identification_at_resolution(
-                    res_subjects, resolution, use_dsr=False
-                )
-                results['table2_identification'][f"{resolution[0]}x{resolution[1]}"] = {
-                    'bicubic': hr_result,
-                    'dsr': hr_result
-                }
-                print(f"  Rank-1: {hr_result['rank1']:.2f}%")
-            else:
-                # VLR - compare bicubic vs DSR
-                print("  Method: Bicubic")
-                bicubic_result = self.evaluate_identification_at_resolution(
-                    res_subjects, resolution, use_dsr=False
-                )
-                
-                print("  Method: DSR")
-                dsr_result = self.evaluate_identification_at_resolution(
-                    res_subjects, resolution, use_dsr=True
-                )
-                
-                results['table2_identification'][f"{resolution[0]}x{resolution[1]}"] = {
-                    'bicubic': bicubic_result,
-                    'dsr': dsr_result
-                }
-                
-                print(f"  Bicubic Rank-1: {bicubic_result['rank1']:.2f}%")
-                print(f"  DSR Rank-1: {dsr_result['rank1']:.2f}%")
-        
-        return results
-    
-    def generate_tables(self, results: Dict, output_path: Path):
-        """
-        Generate formatted tables matching paper format
-        
-        Args:
-            results: Results dictionary from run_evaluation()
-            output_path: Path to save PDF
-        """
-        with PdfPages(output_path) as pdf:
-            # Table 1: Verification
-            fig, ax = plt.subplots(figsize=(12, 6))
-            ax.axis('off')
-            
-            # Prepare table data
-            table_data = [
-                ['Method', '16×16', '24×24', '32×32', '112×112 (HR)']
-            ]
-            
-            # Bicubic row
-            bicubic_row = ['Bicubic']
-            for res in ['16x16', '24x24', '32x32', '112x112']:
-                acc = results['table1_verification'][res]['bicubic']['accuracy']
-                bicubic_row.append(f"{acc:.2f}")
-            table_data.append(bicubic_row)
-            
-            # DSR row
-            dsr_row = ['DSR']
-            for res in ['16x16', '24x24', '32x32', '112x112']:
-                acc = results['table1_verification'][res]['dsr']['accuracy']
-                dsr_row.append(f"{acc:.2f}")
-            table_data.append(dsr_row)
-            
-            table = ax.table(cellText=table_data, loc='center', cellLoc='center')
-            table.auto_set_font_size(False)
-            table.set_fontsize(10)
-            table.scale(1, 2.5)
-            
-            # Style header
-            for i in range(5):
-                table[(0, i)].set_facecolor('#4472C4')
-                table[(0, i)].set_text_props(weight='bold', color='white')
-            
-            # Style method column
-            for i in range(1, 3):
-                table[(i, 0)].set_facecolor('#E8E8E8')
-                table[(i, 0)].set_text_props(weight='bold')
-            
-            ax.set_title('Table 1: Verification Rates (%) on LFW\n(EdgeFace Network, 6,000 pairs)',
-                        fontsize=14, fontweight='bold', pad=20)
-            
-            plt.tight_layout()
-            pdf.savefig(fig, bbox_inches='tight')
-            plt.close()
-            
-            # Table 2: Identification
-            fig, ax = plt.subplots(figsize=(12, 6))
-            ax.axis('off')
-            
-            # Prepare table data
-            table_data = [
-                ['Method', '16×16', '24×24', '32×32', '112×112 (HR)']
-            ]
-            
-            # Bicubic row
-            bicubic_row = ['Bicubic']
-            for res in ['16x16', '24x24', '32x32', '112x112']:
-                rank1 = results['table2_identification'][res]['bicubic']['rank1']
-                bicubic_row.append(f"{rank1:.2f}")
-            table_data.append(bicubic_row)
-            
-            # DSR row
-            dsr_row = ['DSR']
-            for res in ['16x16', '24x24', '32x32', '112x112']:
-                rank1 = results['table2_identification'][res]['dsr']['rank1']
-                dsr_row.append(f"{rank1:.2f}")
-            table_data.append(dsr_row)
-            
-            table = ax.table(cellText=table_data, loc='center', cellLoc='center')
-            table.auto_set_font_size(False)
-            table.set_fontsize(10)
-            table.scale(1, 2.5)
-            
-            # Style header
-            for i in range(5):
-                table[(0, i)].set_facecolor('#4472C4')
-                table[(0, i)].set_text_props(weight='bold', color='white')
-            
-            # Style method column
-            for i in range(1, 3):
-                table[(i, 0)].set_facecolor('#E8E8E8')
-                table[(i, 0)].set_text_props(weight='bold')
-            
-            ax.set_title('Table 2: Rank-1 Identification Rates (%) on LFW\n(EdgeFace Network, Closed-Set)',
-                        fontsize=14, fontweight='bold', pad=20)
-            
-            plt.tight_layout()
-            pdf.savefig(fig, bbox_inches='tight')
-            plt.close()
-        
-        print(f"\nTables saved to: {output_path}")
 
+    def run_evaluation(self) -> Dict:
+        print("\n" + "="*80)
+        print("LFW EVALUATION - FULL SUITE (EXPANDED METRICS)")
+        print("="*80)
+        
+        # Load LFW subjects
+        print("\nLoading LFW subjects from VLR/HR directories...")
+        subjects_by_res = {}
+        for res in self.resolutions:
+            subjects_by_res[res] = self.load_lfw_subjects(res)
+            
+        results = {
+            'verification': {},
+            'identification': {},
+            'image_quality': {}
+        }
+        
+        # Configs to run
+        # (Name, UseDSR, UseFinetuned)
+        configs = [
+            ('Bicubic_Default', False, False),
+            ('Bicubic_Finetuned', False, True),
+            ('DSR_Default', True, False),
+            ('DSR_Finetuned', True, True)
+        ]
+        
+        for res in self.resolutions:
+            res_str = f"{res[0]}x{res[1]}"
+            results['verification'][res_str] = {}
+            results['identification'][res_str] = {}
+            results['image_quality'][res_str] = {}
+            
+            print(f"\nProcessing Resolution: {res_str}")
+            
+            # HR Baseline (only run once per resolution loop, effectively)
+            if res == (112, 112):
+                print(f"  Evaluating HR Baseline...")
+                pipeline = self._get_pipeline(res, use_dsr=False, use_finetuned=False)
+                
+                # Verification
+                ver_metrics = self.evaluate_verification(subjects_by_res[res], pipeline)
+                results['verification'][res_str]['HR_Default'] = ver_metrics
+                
+                # Identification
+                id_metrics = self.evaluate_identification(subjects_by_res[res], pipeline)
+                results['identification'][res_str]['HR_Default'] = id_metrics
+                
+                # Image Quality (Reference)
+                results['image_quality'][res_str]['HR_Default'] = {'psnr': float('inf'), 'ssim': 1.0}
+                continue
+
+            # VLR Evaluations
+            for name, use_dsr, use_finetuned in configs:
+                print(f"  Evaluating {name}...")
+                pipeline = self._get_pipeline(res, use_dsr, use_finetuned)
+                
+                # Verification
+                ver_metrics = self.evaluate_verification(subjects_by_res[res], pipeline)
+                results['verification'][res_str][name] = ver_metrics
+                
+                # Identification
+                id_metrics = self.evaluate_identification(subjects_by_res[res], pipeline)
+                results['identification'][res_str][name] = id_metrics
+                
+                # Image Quality (Only depends on DSR/Bicubic, not EdgeFace)
+                # Avoid re-calculating if already done for this DSR/Bicubic mode?
+                # For simplicity, just run it. It's fast on subset.
+                iq_metrics = self.evaluate_image_quality(
+                    subjects_by_res[res], 
+                    pipeline, 
+                    subjects_by_res[(112, 112)]
+                )
+                results['image_quality'][res_str][name] = iq_metrics
+                
+                print(f"    Acc: {ver_metrics['accuracy']:.2f}%, Rank-1: {id_metrics['rank1']:.2f}%, PSNR: {iq_metrics['psnr']:.2f}")
+
+        return results
+
+    def generate_report(self, results: Dict, output_path: Path):
+        """Generate PDF report with expanded metrics and visualizations"""
+        with PdfPages(output_path) as pdf:
+            
+            # --- Page 1: Verification Summary Table ---
+            fig, ax = plt.subplots(figsize=(11.69, 8.27)) # A4 Landscape
+            ax.axis('off')
+            
+            cols = ['Method', '16x16', '24x24', '32x32']
+            rows = [
+                'Bicubic + Default', 'Bicubic + Finetuned',
+                'DSR + Default', 'DSR + Finetuned',
+                'HR Baseline'
+            ]
+            
+            cell_text = []
+            for row_name in rows:
+                row_data = [row_name]
+                if 'HR' in row_name:
+                    m = results['verification']['112x112']['HR_Default']
+                    val = f"{m['accuracy']:.2f}%\n(VR@0.1%: {m['vr_far_01']:.2f}%)"
+                    row_data.extend([val] * 3)
+                else:
+                    if 'Bicubic + Default' in row_name: key = 'Bicubic_Default'
+                    elif 'Bicubic + Finetuned' in row_name: key = 'Bicubic_Finetuned'
+                    elif 'DSR + Default' in row_name: key = 'DSR_Default'
+                    elif 'DSR + Finetuned' in row_name: key = 'DSR_Finetuned'
+                    
+                    for res in ['16x16', '24x24', '32x32']:
+                        if key in results['verification'][res]:
+                            m = results['verification'][res][key]
+                            val = f"{m['accuracy']:.2f}%\n(VR@0.1%: {m['vr_far_01']:.2f}%)"
+                            row_data.append(val)
+                        else:
+                            row_data.append("-")
+                cell_text.append(row_data)
+            
+            table = ax.table(cellText=cell_text, colLabels=cols, loc='center', cellLoc='center')
+            table.auto_set_font_size(False)
+            table.set_fontsize(10)
+            table.scale(1, 4)
+            ax.set_title('Verification Accuracy & VR@0.1% FAR', fontsize=16, fontweight='bold', pad=20)
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close()
+
+            # --- Page 2: Identification & Image Quality Table ---
+            fig, ax = plt.subplots(figsize=(11.69, 8.27))
+            ax.axis('off')
+            
+            # Combined table for Rank-1 and PSNR
+            cell_text = []
+            for row_name in rows:
+                row_data = [row_name]
+                if 'HR' in row_name:
+                    m_id = results['identification']['112x112']['HR_Default']
+                    val = f"R1: {m_id['rank1']:.2f}%\nPSNR: Inf"
+                    row_data.extend([val] * 3)
+                else:
+                    if 'Bicubic + Default' in row_name: key = 'Bicubic_Default'
+                    elif 'Bicubic + Finetuned' in row_name: key = 'Bicubic_Finetuned'
+                    elif 'DSR + Default' in row_name: key = 'DSR_Default'
+                    elif 'DSR + Finetuned' in row_name: key = 'DSR_Finetuned'
+                    
+                    for res in ['16x16', '24x24', '32x32']:
+                        if key in results['identification'][res]:
+                            m_id = results['identification'][res][key]
+                            # IQ metrics might be missing for finetuned if we skipped re-calc
+                            # But we ran it in loop, so it should be there or copied
+                            if key in results['image_quality'][res]:
+                                m_iq = results['image_quality'][res][key]
+                                psnr_val = f"{m_iq['psnr']:.2f}"
+                            else:
+                                psnr_val = "N/A"
+                                
+                            val = f"R1: {m_id['rank1']:.2f}%\nPSNR: {psnr_val}"
+                            row_data.append(val)
+                        else:
+                            row_data.append("-")
+                cell_text.append(row_data)
+            
+            table = ax.table(cellText=cell_text, colLabels=cols, loc='center', cellLoc='center')
+            table.auto_set_font_size(False)
+            table.set_fontsize(10)
+            table.scale(1, 4)
+            ax.set_title('Identification (Rank-1) & Image Quality (PSNR)', fontsize=16, fontweight='bold', pad=20)
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close()
+
+            # --- Page 3: ROC Curves (16x16) ---
+            self._plot_roc_page(pdf, results, '16x16')
+            
+            # --- Page 4: DET Curves (16x16) ---
+            self._plot_det_page(pdf, results, '16x16')
+            
+            # --- Page 5: Similarity Histograms (16x16) ---
+            self._plot_hist_page(pdf, results, '16x16')
+            
+            # --- Page 6: CMC Curves (16x16) ---
+            self._plot_cmc_page(pdf, results, '16x16')
+
+        print(f"Report saved to {output_path}")
+
+    def _plot_roc_page(self, pdf, results, resolution):
+        """Helper to plot ROC curves for a specific resolution"""
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Plot HR Baseline
+        if 'HR_Default' in results['verification']['112x112']:
+            m = results['verification']['112x112']['HR_Default']
+            if 'fpr' in m:
+                ax.plot(m['fpr'], m['tpr'], label=f"HR Baseline (AUC={m['roc_auc']:.4f})", linestyle='--', color='black')
+        
+        # Plot VLR Methods
+        for key, label, color in [
+            ('Bicubic_Default', 'Bicubic + Default', 'blue'),
+            ('Bicubic_Finetuned', 'Bicubic + Finetuned', 'cyan'),
+            ('DSR_Default', 'DSR + Default', 'red'),
+            ('DSR_Finetuned', 'DSR + Finetuned', 'magenta')
+        ]:
+            if key in results['verification'][resolution]:
+                m = results['verification'][resolution][key]
+                if 'fpr' in m:
+                    ax.plot(m['fpr'], m['tpr'], label=f"{label} (AUC={m['roc_auc']:.4f})", color=color)
+        
+        ax.plot([0, 1], [0, 1], 'k:', alpha=0.2)
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title(f'ROC Curves - {resolution}')
+        ax.legend(loc='lower right')
+        ax.grid(True, alpha=0.3)
+        pdf.savefig(fig)
+        plt.close()
+
+    def _plot_det_page(self, pdf, results, resolution):
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Plot HR Baseline
+        if 'HR_Default' in results['verification']['112x112']:
+            m = results['verification']['112x112']['HR_Default']
+            if 'fpr' in m:
+                # DET: log(FPR) vs log(FNR)
+                fnr = 1 - m['tpr']
+                ax.loglog(m['fpr'], fnr, label=f"HR Baseline", linestyle='--', color='black')
+        
+        for key, label, color in [
+            ('Bicubic_Default', 'Bicubic + Default', 'blue'),
+            ('Bicubic_Finetuned', 'Bicubic + Finetuned', 'cyan'),
+            ('DSR_Default', 'DSR + Default', 'red'),
+            ('DSR_Finetuned', 'DSR + Finetuned', 'magenta')
+        ]:
+            if key in results['verification'][resolution]:
+                m = results['verification'][resolution][key]
+                if 'fpr' in m:
+                    fnr = 1 - m['tpr']
+                    ax.loglog(m['fpr'], fnr, label=label, color=color)
+        
+        ax.set_xlabel('False Positive Rate (log scale)')
+        ax.set_ylabel('False Negative Rate (log scale)')
+        ax.set_title(f'DET Curves - {resolution}')
+        ax.legend()
+        ax.grid(True, which="both", ls="-", alpha=0.2)
+        pdf.savefig(fig)
+        plt.close()
+
+    def _plot_hist_page(self, pdf, results, resolution):
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Only plot DSR_Default vs Bicubic_Default to avoid clutter, or maybe just DSR_Default
+        # Let's plot DSR_Default if available, else Bicubic
+        
+        target_key = 'DSR_Default'
+        if target_key not in results['verification'][resolution]:
+            target_key = 'Bicubic_Default'
+            
+        if target_key in results['verification'][resolution]:
+            m = results['verification'][resolution][target_key]
+            if 'gen_sims' in m:
+                ax.hist(m['gen_sims'], bins=50, alpha=0.5, label='Genuine', density=True, color='green')
+                ax.hist(m['imp_sims'], bins=50, alpha=0.5, label='Impostor', density=True, color='red')
+                ax.set_title(f'Similarity Distribution ({target_key}) - {resolution}')
+                ax.set_xlabel('Cosine Similarity')
+                ax.set_ylabel('Density')
+                ax.legend()
+        else:
+            ax.text(0.5, 0.5, "No data available", ha='center')
+            
+        pdf.savefig(fig)
+        plt.close()
+
+    def _plot_cmc_page(self, pdf, results, resolution):
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        max_rank = 20
+        x = np.arange(1, max_rank + 1)
+        
+        # Helper to get cmc
+        def get_cmc(ranks):
+            cmc = []
+            for r in x:
+                cmc.append(np.mean(ranks <= r) * 100)
+            return cmc
+
+        # HR Baseline
+        if 'HR_Default' in results['identification']['112x112']:
+            m = results['identification']['112x112']['HR_Default']
+            if 'ranks' in m:
+                ax.plot(x, get_cmc(m['ranks']), label='HR Baseline', linestyle='--', color='black')
+
+        for key, label, color in [
+            ('Bicubic_Default', 'Bicubic + Default', 'blue'),
+            ('Bicubic_Finetuned', 'Bicubic + Finetuned', 'cyan'),
+            ('DSR_Default', 'DSR + Default', 'red'),
+            ('DSR_Finetuned', 'DSR + Finetuned', 'magenta')
+        ]:
+            if key in results['identification'][resolution]:
+                m = results['identification'][resolution][key]
+                if 'ranks' in m:
+                    ax.plot(x, get_cmc(m['ranks']), label=label, color=color)
+        
+        ax.set_xlabel('Rank')
+        ax.set_ylabel('Identification Rate (%)')
+        ax.set_title(f'CMC Curves (Rank-1 to {max_rank}) - {resolution}')
+        ax.set_xticks(x)
+        ax.legend(loc='lower right')
+        ax.grid(True, alpha=0.3)
+        pdf.savefig(fig)
+        plt.close()
+
+def clean_results_for_json(results):
+    """Recursively remove numpy arrays from results dict"""
+    if isinstance(results, dict):
+        return {k: clean_results_for_json(v) for k, v in results.items() if not isinstance(v, (np.ndarray, list)) or k not in ['fpr', 'tpr', 'gen_sims', 'imp_sims', 'ranks']}
+    return results
 
 def main():
-    """Main evaluation function"""
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = Path(__file__).resolve().parents[1]
     
-    # Configuration
     dataset_dir = project_root / "technical" / "dataset"
     dsr_dir = project_root / "technical" / "dsr"
     edgeface_dir = project_root / "technical" / "facial_rec" / "edgeface_weights"
     output_dir = project_root / "technical" / "evaluation_results"
     
-    # Verify dataset directory exists
-    if not dataset_dir.exists():
-        print(f"ERROR: Dataset directory not found: {dataset_dir}")
-        return
-    
-    # Create evaluator
     evaluator = LFWEvaluator(
         dataset_dir=dataset_dir,
         dsr_dir=dsr_dir,
@@ -667,41 +742,30 @@ def main():
         device="cuda" if torch.cuda.is_available() else "cpu"
     )
     
-    # Run evaluation
     results = evaluator.run_evaluation()
     
-    # Save results as JSON
-    json_path = output_dir / "lfw_evaluation_results.json"
-    with open(json_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"\nResults saved to: {json_path}")
+    # Generate PDF (uses raw data)
+    evaluator.generate_report(results, output_dir / "benchmark_report.pdf")
     
-    # Generate tables PDF
-    pdf_path = output_dir / "lfw_evaluation_tables.pdf"
-    evaluator.generate_tables(results, pdf_path)
+    # Clean and Save JSON
+    # We need to make a deep copy or just clean it on the fly, but since we are done, we can just clean it.
+    # Actually, the simple cleaner above removes keys.
+    # Better approach: Just pop the keys we added.
     
-    # Print summary
-    print("\n" + "="*80)
-    print("EVALUATION COMPLETE")
-    print("="*80)
-    print("\nTable 1 Summary (Verification Accuracy %):")
-    print("Resolution | Bicubic | DSR")
-    print("-" * 40)
-    # Get actual resolutions from results
-    res_keys = sorted(results['table1_verification'].keys(), key=lambda x: int(x.split('x')[0]))
-    for res in res_keys:
-        bicubic = results['table1_verification'][res]['bicubic']['accuracy']
-        dsr = results['table1_verification'][res]['dsr']['accuracy']
-        print(f"{res:10s} | {bicubic:7.2f} | {dsr:7.2f}")
+    def remove_raw_data(d):
+        if isinstance(d, dict):
+            for k in ['fpr', 'tpr', 'gen_sims', 'imp_sims', 'ranks']:
+                if k in d:
+                    del d[k]
+            for v in d.values():
+                remove_raw_data(v)
     
-    print("\nTable 2 Summary (Rank-1 Identification %):")
-    print("Resolution | Bicubic | DSR")
-    print("-" * 40)
-    for res in res_keys:
-        bicubic = results['table2_identification'][res]['bicubic']['rank1']
-        dsr = results['table2_identification'][res]['dsr']['rank1']
-        print(f"{res:10s} | {bicubic:7.2f} | {dsr:7.2f}")
-
+    import copy
+    json_results = copy.deepcopy(results)
+    remove_raw_data(json_results)
+    
+    with open(output_dir / "full_results.json", 'w') as f:
+        json.dump(json_results, f, indent=2)
 
 if __name__ == "__main__":
     main()

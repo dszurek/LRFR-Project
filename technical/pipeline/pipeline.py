@@ -31,12 +31,12 @@ except ImportError:
     transforms = None  # type: ignore[assignment]
 
 try:
-    from technical.dsr import DSRColor, DSRConfig, load_dsr_model
+    from technical.dsr import HybridDSR, HybridDSRConfig, load_dsr_model
     from technical.facial_rec.edgeface_weights.edgeface import EdgeFace
 except (
     ModuleNotFoundError
 ):  # pragma: no cover - fallback for direct execution inside technical/
-    from dsr import DSRColor, DSRConfig, load_dsr_model
+    from dsr import HybridDSR, HybridDSRConfig, load_dsr_model
     from facial_rec.edgeface_weights.edgeface import EdgeFace
 
 TensorLike = Union["torch.Tensor", np.ndarray]
@@ -233,18 +233,34 @@ class FaceRecognitionPipeline:
         elif "model_state_dict" in state_dict:
             state_dict = state_dict["model_state_dict"]
 
-        # Detect architecture from keys
+        # Detect architecture from keys and shapes
         sample_keys = list(state_dict.keys())[:10]
         if any("stem" in key or "stages" in key for key in sample_keys):
-            backbone = "edgeface_xxs"  # ConvNeXt
-            print("[EdgeFace] Detected ConvNeXt (edgeface_xxs) architecture")
+            # Both xxs and s_gamma_05 are ConvNeXt-based
+            # Distinguish by stem channel size
+            stem_weight = state_dict.get("stem.0.weight")
+            if stem_weight is not None and stem_weight.shape[0] == 48:
+                backbone = "edgeface_s_gamma_05"
+                print("[EdgeFace] Detected ConvNeXt-S (edgeface_s_gamma_05) architecture")
+            elif "gamma_05" in resolved.name:
+                 # Fallback to filename if stem weight not found directly (e.g. prefix issue)
+                backbone = "edgeface_s_gamma_05"
+                print("[EdgeFace] Detected ConvNeXt-S (edgeface_s_gamma_05) by filename")
+            else:
+                backbone = "edgeface_xxs"
+                print("[EdgeFace] Detected ConvNeXt-XXS (edgeface_xxs) architecture")
         elif any("features" in key for key in sample_keys):
             backbone = "edgeface_s"  # LDC
             print("[EdgeFace] Detected LDC (edgeface_s) architecture")
         else:
             # Fallback to filename
             filename = resolved.stem.lower()
-            backbone = "edgeface_xxs" if "xxs" in filename else "edgeface_s"
+            if "gamma_05" in filename:
+                backbone = "edgeface_s_gamma_05"
+            elif "xxs" in filename:
+                backbone = "edgeface_xxs"
+            else:
+                backbone = "edgeface_s"
             print(f"[EdgeFace] Filename-based detection: {backbone}")
 
         # Create model and load weights
@@ -260,15 +276,30 @@ class FaceRecognitionPipeline:
                 clean_key = clean_key[len("backbone.") :]
             clean_state_dict[clean_key] = value
 
+        # Try loading into the wrapper first
         missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
+        
+        # If that failed (many missing keys) and we have a core.model structure (timm wrapper),
+        # try loading into the inner model directly.
+        if len(missing) > 0 and hasattr(model, "core") and hasattr(model.core, "model"):
+            print("[EdgeFace] Detected timm wrapper, attempting load into core.model...")
+            # The checkpoint keys (stem..., stages...) match the inner timm model
+            inner_missing, inner_unexpected = model.core.model.load_state_dict(clean_state_dict, strict=False)
+            
+            if len(inner_missing) < len(missing):
+                print(f"[EdgeFace] Successfully loaded into inner model (missing: {len(inner_missing)})")
+                missing = inner_missing
+                unexpected = inner_unexpected
+            else:
+                print("[EdgeFace] Inner load did not improve missing keys")
+
         if missing:
             print(f"[EdgeFace] Missing keys: {len(missing)}")
-            if len(missing) <= 10:
-                print(f"[EdgeFace]   {missing}")
+            # Only print first few to avoid spam
+            print(f"[EdgeFace]   {missing[:5]}...")
         if unexpected:
             print(f"[EdgeFace] Unexpected keys: {len(unexpected)}")
-            if len(unexpected) <= 10:
-                print(f"[EdgeFace]   {unexpected}")
+            print(f"[EdgeFace]   {unexpected[:5]}...")
 
         model.eval()
         return model

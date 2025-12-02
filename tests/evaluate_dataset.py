@@ -35,7 +35,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - executed only when deps
         "Install the wheels listed in pyproject.toml (or platform-specific builds)"
     ) from exc
 
-from .pipeline import PipelineConfig, build_pipeline
+from technical.pipeline.pipeline import PipelineConfig, build_pipeline
 
 
 @dataclass
@@ -280,6 +280,19 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Path to EdgeFace model weights (e.g., edgeface_xxs.pt, edgeface_finetuned.pth).",
     )
     parser.add_argument(
+        "--dsr-weights",
+        type=Path,
+        default=None,
+        help="Path to DSR model weights (e.g., technical/dsr/hybrid_dsr16.pth).",
+    )
+    parser.add_argument(
+        "--vlr-size",
+        type=int,
+        default=32,
+        choices=[16, 24, 32],
+        help="VLR input size (used to select default DSR model if not specified).",
+    )
+    parser.add_argument(
         "--threshold",
         type=float,
         default=None,
@@ -310,9 +323,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[Iterable[str]] = None) -> None:
-    args = parse_args(argv)
-
+def run_evaluation(args) -> float:
     # Determine gallery and probe directories
     if args.gallery_root and args.probe_root:
         # Split-dataset mode: enroll from one dataset, test on another
@@ -330,13 +341,34 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         # Original mode: same dataset for gallery and probes
         dataset_root: Path = args.dataset_root
         hr_dir: Path = args.hr_dir or dataset_root / "hr_images"
-        vlr_dir: Path = args.vlr_dir or dataset_root / "vlr_images"
+        
+        # Support resolution-specific VLR folders
+        if args.vlr_dir:
+            vlr_dir = args.vlr_dir
+        else:
+            # Try specific resolution folder first
+            vlr_dir_candidate = dataset_root / f"vlr_images_{args.vlr_size}x{args.vlr_size}"
+            if vlr_dir_candidate.exists():
+                vlr_dir = vlr_dir_candidate
+            else:
+                vlr_dir = dataset_root / "vlr_images"
 
     config = PipelineConfig(device=args.device)
     if args.threshold is not None:
         config.recognition_threshold = args.threshold
     if args.edgeface_weights is not None:
         config.edgeface_weights_path = args.edgeface_weights
+    
+    # Set DSR weights
+    if args.dsr_weights is not None:
+        config.dsr_weights_path = args.dsr_weights
+    else:
+        # Default to hybrid model for the specified size
+        base_dir = Path(__file__).resolve().parents[1]
+        default_dsr = base_dir / "technical" / "dsr" / f"hybrid_dsr{args.vlr_size}.pth"
+        if default_dsr.exists():
+            config.dsr_weights_path = default_dsr
+            
     if args.skip_dsr:
         config.skip_dsr = True
 
@@ -376,6 +408,16 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     if args.dump_results:
         dump_results_csv(args.dump_results, results)
         print(f"\nDetailed results written to {args.dump_results}")
+
+    total_probes = len(results)
+    correct = sum(1 for r in results if r.prediction == r.truth)
+    accuracy = correct / total_probes if total_probes else 0.0
+    return accuracy
+
+
+def main(argv: Optional[Iterable[str]] = None) -> None:
+    args = parse_args(argv)
+    run_evaluation(args)
 
 
 if __name__ == "__main__":

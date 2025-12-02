@@ -802,6 +802,9 @@ def main(args: argparse.Namespace) -> None:
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
 
+    # Define train_subject_ids for validation
+    train_subject_ids = set(train_dataset.subject_to_id.values())
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -829,6 +832,16 @@ def main(args: argparse.Namespace) -> None:
         margin=config.arcface_margin,
     ).to(device)
 
+    # Initialize GradScaler for mixed precision training
+    scaler = GradScaler()
+
+    # Optimizer for Stage 1 (Head only)
+    optimizer = optim.AdamW(
+        arcface.parameters(),
+        lr=config.head_lr,
+        weight_decay=config.weight_decay
+    )
+
     # ========================================================================
     # STAGE 1: Freeze backbone, train ArcFace head
     # ========================================================================
@@ -841,6 +854,8 @@ def main(args: argparse.Namespace) -> None:
 
     print(f"[Info] With {len(train_subject_ids)} classes, accuracy will start low and improve gradually")
     print(f"[Info] PRIMARY METRIC: Embedding similarity (should stay >0.95)")
+
+    best_val_similarity = 0.0
 
     for epoch in range(1, config.stage1_epochs + 1):
         # Stage 1: No contrastive learning (just train classification head)
