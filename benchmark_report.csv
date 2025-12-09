@@ -1,8 +1,0 @@
-Input,DSR Model,EdgeFace Model,PSNR,SSIM,Entropy,Accuracy
-Ground Truth (HR),N/A,Default (XXS),Inf,1.0000,N/A,23.95%
-16x16,HybridDSR,Default (XXS),27.17,0.7986,4.6262,13.54%
-24x24,HybridDSR,Default (XXS),29.58,0.8756,4.6480,17.34%
-32x32,HybridDSR,Default (XXS),31.06,0.9167,4.6497,20.04%
-16x16,HybridDSR,Finetuned (16x16),27.17,0.7986,4.6262,20.13%
-24x24,HybridDSR,Finetuned (24x24),29.58,0.8756,4.6480,22.64%
-32x32,HybridDSR,Finetuned (32x32),31.06,0.9167,4.6497,23.70%

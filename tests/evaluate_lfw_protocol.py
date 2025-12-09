@@ -734,6 +734,11 @@ def main():
     edgeface_dir = project_root / "technical" / "facial_rec" / "edgeface_weights"
     output_dir = project_root / "technical" / "evaluation_results"
     
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resolution", type=int, help="Specific resolution to evaluate (e.g. 32)", default=None)
+    args = parser.parse_args()
+
     evaluator = LFWEvaluator(
         dataset_dir=dataset_dir,
         dsr_dir=dsr_dir,
@@ -741,6 +746,13 @@ def main():
         output_dir=output_dir,
         device="cuda" if torch.cuda.is_available() else "cpu"
     )
+    
+    if args.resolution:
+        # We need to load 112x112 subjects for Image Quality comparison
+        # But we only want to run evaluation loop for the requested resolution
+        evaluator.resolutions = [(args.resolution, args.resolution)]
+        if args.resolution != 112:
+             evaluator.resolutions.append((112, 112))
     
     results = evaluator.run_evaluation()
     

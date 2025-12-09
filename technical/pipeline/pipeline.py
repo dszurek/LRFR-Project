@@ -57,7 +57,7 @@ class PipelineConfig:
 
     dsr_weights_path: Path = Path("dsr/dsr32.pth")
     edgeface_weights_path: Path = Path(
-        "facial_rec/edgeface_weights/edgeface_finetuned.pth"
+        "facial_rec/edgeface_weights/edgeface_xxs.pt"
     )
     device: Union[str, Any] = "cpu"
     recognition_threshold: float = 0.35  # Lowered from 0.45 based on evaluation results

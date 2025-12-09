@@ -18,10 +18,8 @@
 
 \maketitle
 
-
-
 \begin{abstract}
-Low-resolution facial recognition (LRFR) remains a critical challenge in real-world surveillance and security systems where imaging conditions are suboptimal. This paper presents an end-to-end pipeline that integrates identity-aware super-resolution with efficient facial recognition to address the very-low-resolution (VLR) face recognition problem. Our approach combines a Deep Super-Resolution Color (DSR) network trained with perceptual and identity-preserving losses, and EdgeFace, a lightweight recognition backbone optimized for embedded deployment. Unlike conventional approaches that treat super-resolution and recognition as independent modules, we introduce a cycle training strategy where DSR learns to preserve features that EdgeFace recognizes best, creating synergistic co-optimization between the two stages. We incorporate multi-scale perceptual loss, identity cosine embedding loss, and metric learning fine-tuning to bridge the domain gap between super-resolved and high-resolution embeddings. Evaluated on {INSERT DATASET NAME HERE} with probe images at 16×16, 24×24, and 32×32 resolutions, our pipeline demonstrates progressive improvement in recognition accuracy with increasing resolution. Our 32×32 configuration achieves ROC-AUC of 0.938 with EER of 13.3\%, while maintaining real-time inference capability suitable for edge devices. Our contributions include: (1) an identity-aware DSR architecture with identity-preserving supervision from fine-tuned recognition networks, (2) a two-stage training methodology coupling super-resolution and recognition optimization, and (3) comprehensive evaluation across three VLR resolutions with detailed performance metrics.
+Low-resolution facial recognition (LRFR) remains a critical challenge in real-world surveillance and security systems where imaging conditions are suboptimal. This paper presents an end-to-end pipeline that integrates identity-aware super-resolution with efficient facial recognition to address the very-low-resolution (VLR) face recognition problem. Our approach combines a Hybrid Transformer-CNN Deep Super-Resolution (DSR) network, utilizing Max-Feature-Map (MFM) activation for efficient feature selection and transformer attention for global context, with EdgeFace, a lightweight recognition backbone optimized for embedded deployment. Unlike conventional approaches that treat super-resolution and recognition as independent modules, we introduce a three-phase cycle training strategy where DSR and EdgeFace are co-optimized: DSR learns to preserve features that EdgeFace recognizes best, and EdgeFace adapts to the super-resolved distribution. We incorporate multi-scale perceptual loss, identity cosine embedding loss, cross-photo identity consistency, and discriminative supervision to bridge the domain gap. Evaluated on {INSERT DATASET NAME HERE} with probe images at 16×16, 24×24, and 32×32 resolutions, our pipeline demonstrates progressive improvement in recognition accuracy. Our 32×32 configuration achieves {INSERT METRICS HERE}, while maintaining real-time inference capability suitable for edge devices. Our contributions include: (1) a lightweight Hybrid DSR architecture (< 5.5M parameters) with identity-preserving supervision, (2) a cyclic training methodology coupling super-resolution and recognition optimization, and (3) comprehensive evaluation across three VLR resolutions.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -40,173 +38,107 @@ Traditional face recognition pipelines, trained predominantly on high-resolution
 
 Super-resolution (SR) techniques offer a promising pathway to address VLR-FR by reconstructing plausible high-resolution details from low-resolution inputs. However, generic SR models optimized for perceptual quality metrics (PSNR, SSIM) do not necessarily preserve identity-discriminative features required for recognition. A super-resolved face may appear visually pleasing yet fail to maintain the embedding consistency needed for accurate matching against a gallery. This disconnect motivates the need for \textit{identity-aware super-resolution}—SR models explicitly trained to preserve features that recognition networks rely upon.
 
-Our work is motivated by three key observations: (1) SR and recognition stages should be jointly optimized rather than treated as independent modules, (2) lightweight architectures are essential for deployment on edge devices with limited compute budgets, and (3) domain adaptation between SR outputs and recognition model expectations significantly impacts end-to-end accuracy. We address these challenges through a novel pipeline coupling a Deep Super-Resolution Color (DSR) network with EdgeFace, a compact recognition backbone, unified via identity-preserving training objectives and cycle optimization.
+Our work is motivated by three key observations: (1) SR and recognition stages should be jointly optimized rather than treated as independent modules, (2) lightweight architectures are essential for deployment on edge devices with limited compute budgets, and (3) domain adaptation between SR outputs and recognition model expectations significantly impacts end-to-end accuracy. We address these challenges through a novel pipeline coupling a Hybrid Transformer-CNN Deep Super-Resolution (DSR) network with EdgeFace, a compact recognition backbone, unified via identity-preserving training objectives and cycle optimization.
 
 \subsection{Novelty and Contributions}
 
 This paper makes the following contributions to the VLR facial recognition problem:
 
 \begin{enumerate}[leftmargin=*]
-    \item \textbf{Identity-Aware DSR Architecture:} We extend the DSR super-resolution framework with multi-scale perceptual loss, identity-preserving cosine embedding loss, and feature-matching supervision from intermediate recognition network layers. This ensures SR outputs not only exhibit high visual fidelity but also maintain embedding consistency with high-resolution counterparts.
+    \item \textbf{Hybrid Transformer-CNN DSR Architecture:} We introduce a lightweight DSR architecture (< 5.5M parameters) that combines the local feature extraction efficiency of CNNs with the global context modeling of Transformers. We employ Max-Feature-Map (MFM) activation for feature selection and multi-head attention to hallucinate plausible facial structures.
     
-    \item \textbf{Cycle Training Strategy:} We propose a two-stage training methodology where EdgeFace is first fine-tuned on DSR outputs using ArcFace metric learning, then DSR is retrained using the fine-tuned EdgeFace as the identity supervisor. This creates a feedback loop enabling co-adaptation between SR and recognition stages.
+    \item \textbf{Cycle Training Strategy:} We propose a three-phase training methodology where EdgeFace is fine-tuned on DSR outputs, and DSR is retrained using the fine-tuned EdgeFace as a supervisor. This creates a feedback loop enabling co-adaptation between SR and recognition stages.
     
-    \item \textbf{Multi-Resolution Training:} We train separate DSR models for three VLR input resolutions (16×16, 24×24, 32×32), each optimized for upsampling to 112×112 recognition input size, demonstrating scalability across degradation levels.
+    \item \textbf{Identity-Aware Loss Functions:} We optimize DSR using a comprehensive set of losses including multi-scale perceptual loss, identity cosine embedding loss, cross-photo identity consistency, and discriminative supervision to ensure embedding consistency.
     
-    \item \textbf{Lightweight Pipeline Design:} Our complete pipeline operates with configurable DSR architectures (16 blocks for 32×32, 18 for 24×24, 20 for 16×16) coupled with EdgeFace-XXS backbone (512-dimensional embeddings), achieving real-time inference on edge devices while maintaining competitive recognition accuracy.
+    \item \textbf{Multi-Resolution Scalability:} We train separate DSR models for three VLR input resolutions (16×16, 24×24, 32×32), demonstrating the pipeline's effectiveness across various degradation levels.
     
-    \item \textbf{Comprehensive Performance Analysis:} We provide detailed verification and identification metrics including ROC-AUC, EER, TAR at multiple FAR thresholds, and CMC curves across all three resolutions with quantitative performance comparison.
+    \item \textbf{Comprehensive Evaluation:} We provide detailed verification and identification metrics including ROC-AUC, EER, and Rank-1 accuracy, alongside computational efficiency analysis suitable for edge deployment.
 \end{enumerate}
-
-Our pipeline achieves a balance between recognition accuracy and computational efficiency, making it suitable for deployment in resource-constrained environments such as Raspberry Pi 5-class hardware with 4GB memory and CPU-only operation.
 
 \section{Related Work}
 
 \subsection{Deep Learning for Super-Resolution}
 
-Single image super-resolution (SISR) has progressed rapidly with the advent of deep learning. Early work by Dong et al.~\cite{srcnn} introduced SRCNN, a three-layer CNN that learned end-to-end mapping from low to high resolution. Subsequent architectures like VDSR~\cite{vdsr} and EDSR~\cite{edsr} increased network depth and removed batch normalization to improve gradient flow. Kim et al.'s DRCN~\cite{drcn} employed recursive layers for parameter efficiency, while Lim et al.'s EDSR~\cite{edsr} removed unnecessary modules to achieve state-of-the-art PSNR.
+Single image super-resolution (SISR) has progressed rapidly with the advent of deep learning. Early work by Dong et al.~\cite{srcnn} introduced SRCNN, a three-layer CNN that learned end-to-end mapping from low to high resolution. Subsequent architectures like VDSR~\cite{vdsr} and EDSR~\cite{edsr} increased network depth and removed batch normalization to improve gradient flow. Kim et al.'s DRCN~\cite{drcn} employed recursive layers for parameter efficiency.
 
-Perceptual loss, introduced by Johnson et al.~\cite{perceptual_loss}, shifted focus from pixel-wise MSE to feature-level similarity using pretrained VGG networks. SRGAN~\cite{srgan} combined perceptual loss with adversarial training to generate photo-realistic textures, though at the cost of introducing artifacts that may harm downstream recognition. More recent work like ESRGAN~\cite{esrgan} and RealSR~\cite{realsr} refine GAN training for better perceptual quality.
+Perceptual loss, introduced by Johnson et al.~\cite{perceptual_loss}, shifted focus from pixel-wise MSE to feature-level similarity using pretrained VGG networks. SRGAN~\cite{srgan} combined perceptual loss with adversarial training to generate photo-realistic textures. More recent work like ESRGAN~\cite{esrgan} and RealSR~\cite{realsr} refine GAN training for better perceptual quality.
 
-For face super-resolution specifically, FSRNet~\cite{fsrnet} and SPARNet~\cite{sparnet} incorporate facial priors (landmarks, parsing maps) to guide reconstruction. However, these methods optimize for visual quality rather than recognition performance, leading to a disconnect between SR output and recognition model expectations.
+For face super-resolution specifically, FSRNet~\cite{fsrnet} and SPARNet~\cite{sparnet} incorporate facial priors (landmarks, parsing maps) to guide reconstruction. However, these methods often optimize for visual quality rather than recognition performance.
 
 \subsection{Low-Resolution Face Recognition}
 
-Low-resolution face recognition has been approached from multiple angles. Early methods like Hennings-Yeomans et al.~\cite{hennings2007} employed simultaneous SR and recognition in a coupled framework. Biswas et al.~\cite{biswas2011} proposed multidimensional scaling to learn a common embedding space for HR and LR faces.
+Low-resolution face recognition has been approached from multiple angles. Early methods like Hennings-Yeomans et al.~\cite{hennings2007} employed simultaneous SR and recognition. Biswas et al.~\cite{biswas2011} proposed multidimensional scaling to learn a common embedding space.
 
-With deep learning, Li et al.'s Coupled-GAN~\cite{coupledgan} jointly trained SR and recognition networks with shared parameters. Chen et al.'s LCNN~\cite{lcnn} introduced attention mechanisms to focus on discriminative facial regions during recognition. More recently, He et al.'s DSR framework~\cite{dsr} demonstrated that residual dense blocks with identity loss improve recognition accuracy.
+With deep learning, Li et al.'s Coupled-GAN~\cite{coupledgan} jointly trained SR and recognition networks. Chen et al.'s LCNN~\cite{lcnn} introduced attention mechanisms. More recently, He et al.'s DSR framework~\cite{dsr} demonstrated that residual dense blocks with identity loss improve recognition accuracy.
 
-Domain adaptation approaches like DRAN~\cite{dran} and DADE~\cite{dade} learn resolution-invariant features through adversarial training or metric learning. However, these methods often require paired HR-LR training data or complex training procedures. Our approach simplifies the pipeline by explicitly training SR to preserve recognition features through identity-aware losses.
+Domain adaptation approaches like DRAN~\cite{dran} and DADE~\cite{dade} learn resolution-invariant features. Our approach simplifies the pipeline by explicitly training SR to preserve recognition features through identity-aware losses and cycle training.
 
 \subsection{Efficient Face Recognition Models}
 
-The recognition stage of our pipeline leverages lightweight architectures suitable for edge deployment. MobileFaceNets~\cite{mobilefacenet} introduced depthwise separable convolutions for mobile devices. ShuffleFaceNet~\cite{shufflefacenet} employed channel shuffle operations to reduce FLOPs while maintaining accuracy.
+The recognition stage of our pipeline leverages lightweight architectures suitable for edge deployment. MobileFaceNets~\cite{mobilefacenet} introduced depthwise separable convolutions. ShuffleFaceNet~\cite{shufflefacenet} employed channel shuffle operations.
 
-EdgeFace~\cite{edgeface}, our chosen backbone, balances efficiency and accuracy through carefully designed bottleneck blocks and lightweight depthwise convolutions (LDC). We use the EdgeFace-XXS variant with 1.24M parameters and 512-dimensional embeddings, achieving competitive performance while running at real-time speeds on resource-constrained hardware.
-
-\subsection{Joint Super-Resolution and Recognition}
-
-Several works have explored coupling SR and recognition. Yu et al.'s Identity-Aware SR~\cite{identity_aware_sr} introduced triplet loss to maintain identity consistency during SR. Xu et al.'s Learn-SR~\cite{learn_sr} employed a recognition network to provide feature-level supervision for SR training.
-
-Our work extends this direction by: (1) incorporating multi-scale perceptual and feature-matching losses at intermediate network depths, (2) introducing a cycle training procedure where recognition and SR networks co-adapt, and (3) demonstrating effectiveness on very-low-resolution inputs (16×16) rather than moderately low resolution (32×32 or higher). Unlike prior work focusing on PSNR/SSIM metrics, we optimize directly for recognition accuracy through identity-preserving objectives.
+EdgeFace~\cite{edgeface}, our chosen backbone, balances efficiency and accuracy through carefully designed bottleneck blocks and lightweight depthwise convolutions (LDC). We use the EdgeFace-XXS variant with 1.24M parameters and 512-dimensional embeddings.
 
 \section{Methodology}
 
-Our pipeline consists of three key components: (1) the Deep Super-Resolution Color (DSR) network for upsampling VLR inputs to recognition-suitable resolution, (2) the EdgeFace recognition backbone for extracting identity embeddings, and (3) a cycle training strategy that jointly optimizes both stages for maximum recognition accuracy. Figure~\ref{fig:pipeline} illustrates the overall architecture.
+Our pipeline consists of three key components: (1) the Hybrid Transformer-CNN DSR network for upsampling VLR inputs, (2) the EdgeFace recognition backbone, and (3) a cycle training strategy that jointly optimizes both stages.
 
-\subsection{Deep Super-Resolution Color (DSR) Network}
+\subsection{Hybrid Transformer-CNN DSR Network}
 
 \subsubsection{Architecture}
 
-The DSR network builds upon residual learning principles to reconstruct high-frequency facial details from very-low-resolution inputs. Our implementation uses resolution-specific architectures:
+The DSR network employs a Hybrid Transformer-CNN architecture designed to capture both local details and global context while maintaining efficiency. Our implementation uses resolution-specific configurations to balance performance and parameter count (< 5.5M):
 
 \begin{itemize}[leftmargin=*]
-    \item \textbf{Input Layer:} A 3×3 convolutional layer maps RGB input to a resolution-dependent channel space (132 channels for 16×16, 126 for 24×24, 120 for 32×32).
-    \item \textbf{Residual Blocks:} Resolution-dependent number of residual blocks (20 blocks for 16×16, 18 for 24×24, 16 for 32×32) with 3×3 convolutions and skip connections. Each block follows: Conv→ReLU→Conv→Add.
-    \item \textbf{Upsampling:} Pixel shuffle layers~\cite{pixelshuffle} progressively upscale features to 112×112 target resolution without introducing checkerboard artifacts.
-    \item \textbf{Output Layer:} A final 3×3 convolution reconstructs RGB channels with appropriate activation.
+    \item \textbf{Shallow Feature Extraction:} A 3×3 convolutional layer maps RGB input to a base channel space (96 for 16×16, 112 for 24×24, 120 for 32×32).
+    \item \textbf{Deep Feature Extraction:} A sequence of Residual Blocks (8 for 16×16, 6 for 24×24, 5 for 32×32) employing Max-Feature-Map (MFM) activation. MFM acts as a feature selection mechanism, splitting channels and taking the maximum to suppress noise and enhance discriminative features.
+    \item \textbf{Global Context:} Transformer Attention Blocks (4 for 16×16/24×24, 3 for 32×32) with multi-head self-attention (8 heads) and MLP expansion ratio of 2.0. This captures long-range dependencies crucial for hallucinating plausible facial structures.
+    \item \textbf{Upsampling:} Pixel shuffle layers~\cite{pixelshuffle} progressively upscale features to the target resolution.
+    \item \textbf{Reconstruction:} A final 3×3 convolution produces the RGB output.
 \end{itemize}
-
-The resolution-adaptive architecture balances reconstruction capacity with inference efficiency. Smaller VLR inputs require more capacity (deeper networks, more channels) to recover lost information.
 
 \subsubsection{Training Objectives}
 
-DSR training employs a multi-component loss function designed to optimize both perceptual quality and identity preservation:
+DSR training employs a comprehensive loss function ($\mathcal{L}_{\text{DSR}}$) weighting identity preservation over pure pixel fidelity:
 
 \begin{equation}
-\mathcal{L}_{\text{DSR}} = \lambda_{\text{L1}} \mathcal{L}_{\text{L1}} + \lambda_{\text{P}} \mathcal{L}_{\text{P}} + \lambda_{\text{ID}} \mathcal{L}_{\text{ID}} + \lambda_{\text{FM}} \mathcal{L}_{\text{FM}} + \lambda_{\text{TV}} \mathcal{L}_{\text{TV}}
+\mathcal{L}_{\text{DSR}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{P}}\mathcal{L}_{\text{P}} + \lambda_{\text{ID}}\mathcal{L}_{\text{ID}} + \lambda_{\text{Disc}}\mathcal{L}_{\text{Disc}} + \lambda_{\text{TV}}\mathcal{L}_{\text{TV}}
 \end{equation}
 
-\textbf{Pixel Reconstruction Loss ($\mathcal{L}_{\text{L1}}$):} Standard L1 distance between super-resolved output $I_{\text{SR}}$ and ground-truth high-resolution image $I_{\text{HR}}$:
-\begin{equation}
-\mathcal{L}_{\text{L1}} = \|I_{\text{SR}} - I_{\text{HR}}\|_1
-\end{equation}
-
-\textbf{Multi-Scale Perceptual Loss ($\mathcal{L}_{\text{P}}$):} We extract features from multiple layers of a pretrained VGG-19 network and compute weighted L1 distance to preserve perceptual quality:
-\begin{equation}
-\mathcal{L}_{\text{P}} = \sum_{l} w_l \|\phi_l(I_{\text{SR}}) - \phi_l(I_{\text{HR}})\|_1
-\end{equation}
-where $\phi_l$ denotes features from layer $l$, prioritizing layers that capture facial structure.
-
-\textbf{Identity Preservation Loss ($\mathcal{L}_{\text{ID}}$):} To ensure SR outputs maintain identity consistency, we employ cosine embedding loss on EdgeFace embeddings:
-\begin{equation}
-\mathcal{L}_{\text{ID}} = 1 - \frac{\mathbf{e}_{\text{SR}} \cdot \mathbf{e}_{\text{HR}}}{\|\mathbf{e}_{\text{SR}}\| \|\mathbf{e}_{\text{HR}}\|}
-\end{equation}
-where $\mathbf{e}_{\text{SR}} = \text{EdgeFace}(I_{\text{SR}})$ and $\mathbf{e}_{\text{HR}} = \text{EdgeFace}(I_{\text{HR}})$.
-
-\textbf{Total Variation Loss ($\mathcal{L}_{\text{TV}}$):} To encourage spatial smoothness while preserving edges:
-\begin{equation}
-\mathcal{L}_{\text{TV}} = \sum_{i,j} (|I_{\text{SR}}(i+1,j) - I_{\text{SR}}(i,j)| + |I_{\text{SR}}(i,j+1) - I_{\text{SR}}(i,j)|)
-\end{equation}
-
-{INSERT ACTUAL LOSS WEIGHTS HERE}
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Pixel Loss ($\lambda_{\text{L1}}=1.0$):} L1 distance between SR and HR images.
+    \item \textbf{Perceptual Loss ($\lambda_{\text{P}}=0.02$):} Multi-scale VGG-19 feature distance.
+    \item \textbf{Identity Loss ($\mathcal{L}_{\text{ID}}$):} Composed of Cosine Similarity ($\lambda=15.0-18.0$), Cross-Photo Consistency ($\lambda=3.0-4.0$), Embedding Magnitude ($\lambda=0.15$), and Feature Correlation ($\lambda=2.0-3.0$) losses, computed using the EdgeFace backbone.
+    \item \textbf{Discriminative Loss ($\lambda_{\text{Disc}}=8.0$):} Ensures SR outputs of different identities remain separable in embedding space.
+    \item \textbf{Total Variation ($\lambda_{\text{TV}}=10^{-5}$):} Regularization for spatial smoothness.
+\end{itemize}
 
 \subsubsection{Training Configuration}
 
-DSR is trained for 100 epochs with batch size 16 using AdamW optimizer (learning rate $1.5 \times 10^{-4}$, weight decay $10^{-6}$). We employ a 5-epoch linear warmup followed by cosine annealing. Gradient clipping (max norm 1.0) prevents instability, and exponential moving average (EMA, decay 0.999) smooths weight updates. Mixed-precision training (FP16) accelerates convergence on CUDA devices. Early stopping with patience 20 epochs halts training when validation PSNR plateaus.
-
-Data augmentation includes: horizontal flipping (50\% probability), small rotation (±5°, 60\% probability), and mild color jitter (brightness/contrast ±5\%, saturation ±3\%, 25\% probability). Aggressive augmentation is avoided to prevent degrading identity features.
+DSR is trained for 150 epochs using the AdamW optimizer with a OneCycleLR scheduler (max LR $4 \times 10^{-4}$). We employ mixed-precision training (BF16/FP16) and gradient clipping (norm 1.0). Data augmentation includes MixUp, CutMix, horizontal flipping, rotation, and color jitter to improve robustness.
 
 \subsection{EdgeFace Recognition Network}
 
 \subsubsection{Architecture}
 
-EdgeFace employs a lightweight bottleneck design optimized for mobile deployment:
-
-\begin{itemize}[leftmargin=*]
-    \item \textbf{Stem:} Initial 3×3 convolution with stride 2 maps 112×112 RGB input to 32 channels.
-    \item \textbf{Stages:} Four stages progressively downsample features (56×56→28×28→14×14→7×7) while increasing channels (32→64→128→256→512). Each stage contains stacked Lightweight Depthwise Convolution (LDC) blocks with residual connections.
-    \item \textbf{Embedding Head:} Global average pooling followed by fully connected layer projects 512×7×7 features to 512-dimensional embedding space. Final batch normalization ensures unit variance.
-\end{itemize}
-
-The LDC block structure is:
-\begin{equation}
-\text{LDC}(x) = x + \text{Conv}_{1 \times 1}(\text{DWConv}_{3 \times 3}(\text{Conv}_{1 \times 1}(x)))
-\end{equation}
-where DWConv denotes depthwise separable convolution. This reduces FLOPs by 8-9× compared to standard convolutions while preserving expressive power.
+EdgeFace employs a lightweight bottleneck design optimized for mobile deployment. It uses Lightweight Depthwise Convolution (LDC) blocks to reduce FLOPs while preserving expressive power. We use the EdgeFace-XXS variant which produces 512-dimensional embeddings.
 
 \subsubsection{ArcFace Metric Learning}
 
-For fine-tuning EdgeFace on DSR outputs, we employ ArcFace~\cite{arcface} additive angular margin loss:
-\begin{equation}
-\mathcal{L}_{\text{ArcFace}} = -\log \frac{e^{s \cos(\theta_{y_i} + m)}}{e^{s \cos(\theta_{y_i} + m)} + \sum_{j \neq y_i} e^{s \cos \theta_j}}
-\end{equation}
-where $\theta_j$ is the angle between embedding and weight vector for class $j$, $s=64$ is the scale parameter, and $m=0.5$ is the angular margin. ArcFace encourages intra-class compactness and inter-class separability, forming tighter embedding clusters than softmax classification.
-
-\subsubsection{Two-Stage Fine-Tuning}
-
-EdgeFace fine-tuning proceeds in two stages:
-
-\textbf{Stage 1 (5 epochs):} Freeze EdgeFace backbone, train only the ArcFace classification head on DSR-upscaled training images. Learning rate $10^{-3}$ with AdamW.
-
-\textbf{Stage 2 (20 epochs):} Unfreeze entire network, fine-tune end-to-end with low learning rates (backbone: $5 \times 10^{-6}$, head: $5 \times 10^{-5}$). Cosine annealing with early stopping (patience 8). This prevents catastrophic forgetting of pretrained features while adapting to DSR output distribution.
-
-\subsection{Pipeline Integration and Inference}
-
-At inference time, the pipeline operates as follows:
-
-\begin{enumerate}[leftmargin=*]
-    \item \textbf{Super-Resolution:} VLR probe image (16×16) is fed to DSR, producing 128×128 super-resolved output.
-    \item \textbf{Preprocessing:} SR output is resized to 112×112 and normalized (mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5]) for EdgeFace input.
-    \item \textbf{Embedding Extraction:} EdgeFace produces 512-dimensional L2-normalized embedding.
-    \item \textbf{Gallery Matching:} Cosine similarity is computed between probe embedding and all gallery embeddings. Identity with maximum similarity above threshold $\tau$ (typically 0.35) is returned; otherwise, probe is classified as unknown.
-\end{enumerate}
-
-The gallery consists of averaged embeddings from multiple HR images per subject. We avoid upsampling gallery images through DSR, as HR→DSR→EdgeFace introduces unnecessary degradation compared to direct HR→EdgeFace.
+For fine-tuning EdgeFace on DSR outputs, we employ ArcFace~\cite{arcface} additive angular margin loss ($s=64, m=0.5$) to encourage intra-class compactness and inter-class separability.
 
 \subsection{Cycle Training Strategy}
 
-Our key innovation is the cycle training procedure:
+Our pipeline employs a three-phase cycle training strategy to co-adapt the super-resolution and recognition models:
 
-\textbf{Cycle 0:} Train DSR using original pretrained EdgeFace (edgeface\_xxs.pt) as identity supervisor. This establishes baseline SR capability.
+\textbf{Phase 1 (DSR Training):} Train Hybrid DSR using the pretrained EdgeFace-XXS as the identity supervisor. This establishes a baseline SR capability that respects the original embedding space.
 
-\textbf{Cycle 1:} Fine-tune EdgeFace on DSR outputs from Cycle 0 using ArcFace loss. EdgeFace learns to recognize faces specifically from DSR's output distribution.
+\textbf{Phase 2 (EdgeFace Fine-tuning):} Fine-tune EdgeFace on the DSR outputs from Phase 1. This adapts the recognition model to the specific distribution of super-resolved images, improving its robustness to artifacts and missing details.
 
-\textbf{Cycle 2:} Retrain DSR using fine-tuned EdgeFace from Cycle 1 as identity supervisor. DSR learns to produce outputs that the fine-tuned EdgeFace recognizes best.
+\textbf{Phase 3 (DSR Retraining):} Retrain Hybrid DSR using the fine-tuned EdgeFace from Phase 2 as the supervisor. The DSR network now learns to produce features that are most discriminative for the adapted recognition model.
 
-This creates a feedback loop where SR and recognition co-adapt. Cycle 2 is the final model, as further cycling (Cycle 3+) yields diminishing returns (<2\% accuracy gain) with risk of mode collapse (models overfitting to each other's biases).
-
-The cycle training philosophy is: DSR learns ``what features EdgeFace needs'', and EdgeFace learns ``what features DSR can produce''. This bridges the domain gap between SR outputs and recognition model expectations more effectively than independent training.
+This cycle creates a synergistic feedback loop: DSR learns ``what features EdgeFace needs'', and EdgeFace learns ``what features DSR produces''.
 
 \section{Experiments and Results}
 
@@ -214,28 +146,11 @@ The cycle training philosophy is: DSR learns ``what features EdgeFace needs'', a
 
 We evaluate our pipeline on {INSERT DATASET NAME HERE}, a frontal-face dataset with train/validation/test splits. {INSERT SUBJECT COUNT AND SPLIT DETAILS HERE}. For each subject, we select frontal-view images as high-resolution (HR) references, resized to 112×112 for recognition input.
 
-Very-low-resolution (VLR) probes are synthesized by downsampling HR images using bicubic interpolation to 16×16, 24×24, and 32×32 pixels, simulating various degrees of surveillance degradation. The DSR network upsamples these VLR images to 112×112 for EdgeFace recognition. {INSERT TEST SET SIZE AND GALLERY/PROBE STRUCTURE HERE}.
+Very-low-resolution (VLR) probes are synthesized by downsampling HR images using bicubic interpolation to 16×16, 24×24, and 32×32 pixels.
 
 \subsection{Evaluation Metrics}
 
-Recognition performance is measured using:
-
-\begin{itemize}[leftmargin=*]
-    \item \textbf{Rank-1 Accuracy:} Percentage of probes where the top-1 gallery match is correct.
-    \item \textbf{True Accept Rate (TAR) at threshold $\tau$:} Percentage of genuine matches (same identity) with similarity $\geq \tau$.
-    \item \textbf{False Accept Rate (FAR):} Percentage of impostor matches (different identities) with similarity $\geq \tau$.
-    \item \textbf{Unknown Rate:} Percentage of probes with maximum similarity $< \tau$ (rejected as unknown).
-\end{itemize}
-
-We report accuracy at threshold $\tau = 0.35$, selected via validation set sweep to balance true accepts and false accepts. Super-resolution quality is evaluated using PSNR and SSIM on validation set, though our primary metric is end-to-end recognition accuracy.
-
-\subsection{Implementation Details}
-
-\textbf{Hardware:} Training is conducted on {INSERT TRAINING HARDWARE HERE}. Inference is evaluated on both CUDA-enabled workstation and edge devices.
-
-\textbf{Software:} PyTorch 2.0+ with CUDA support for GPU training. {INSERT MIXED-PRECISION AND OPTIMIZATION DETAILS IF USED}.
-
-{INSERT ACTUAL TRAINING TIME AND HYPERPARAMETERS HERE}
+Recognition performance is measured using Rank-1 Accuracy, ROC-AUC, EER, and True Accept Rate (TAR) at fixed False Accept Rate (FAR). We report accuracy at threshold $\tau = 0.35$.
 
 \subsection{Results and Analysis}
 
@@ -251,22 +166,18 @@ Table~\ref{tab:main_results} summarizes recognition and reconstruction performan
 \hline
 \textbf{VLR Size} & \textbf{Rank-1 Acc.} & \textbf{ROC-AUC} & \textbf{EER} & \textbf{PSNR/SSIM} \\
 \hline
-16×16 & 2.65\% & 0.811 & 27.2\% & 27.28 dB / 0.702 \\
-24×24 & 2.10\% & 0.847 & 23.7\% & 31.57 dB / 0.876 \\
-32×32 & 4.26\% & 0.938 & 13.3\% & 33.85 dB / 0.919 \\
+16×16 & {INSERT} & {INSERT} & {INSERT} & {INSERT} \\
+24×24 & {INSERT} & {INSERT} & {INSERT} & {INSERT} \\
+32×32 & {INSERT} & {INSERT} & {INSERT} & {INSERT} \\
 \hline
 \end{tabular}
 \end{table}
 
-Our pipeline achieves best verification performance (ROC-AUC 0.938) and identification performance (Rank-1 4.26\%) at 32×32 VLR input, with EER of 13.3\%. Smaller input resolutions show degraded recognition: 16×16 achieves only 2.65\% Rank-1 with ROC-AUC 0.811, indicating severe information loss at extreme downsampling. Super-resolution quality (PSNR/SSIM) improves with larger inputs as expected.
-
-{INSERT ABLATION STUDY RESULTS IF AVAILABLE - we evaluated the full pipeline but did not conduct systematic ablation experiments testing individual loss component contributions}
-
-{INSERT CYCLE TRAINING COMPARISON IF AVAILABLE - we implemented cycle training but did not track intermediate accuracy after each cycle}
+Our pipeline achieves its best performance at 32×32 VLR input. Smaller input resolutions show degraded recognition, indicating the challenge of information loss at extreme downsampling. Super-resolution quality (PSNR/SSIM) generally improves with larger inputs.
 
 \subsubsection{Qualitative Analysis}
 
-Visual inspection of super-resolved outputs suggests that identity-aware training produces sharper facial features compared to generic SR models optimized purely for PSNR. Our results indicate that PSNR/SSIM do not correlate perfectly with recognition performance - while 32×32 achieves high PSNR (33.85 dB) and SSIM (0.919), the corresponding Rank-1 accuracy (4.26\%) remains modest, indicating fundamental challenges in very-low-resolution face recognition beyond reconstruction quality.
+Visual inspection of super-resolved outputs suggests that identity-aware training produces sharper facial features compared to generic SR models optimized purely for PSNR. Our results indicate that PSNR/SSIM do not correlate perfectly with recognition performance - while 32×32 achieves high PSNR and SSIM, the corresponding Rank-1 accuracy remains modest, indicating fundamental challenges in very-low-resolution face recognition beyond reconstruction quality.
 
 \subsubsection{Computational Efficiency}
 
@@ -274,36 +185,25 @@ Visual inspection of super-resolved outputs suggests that identity-aware trainin
 
 \subsubsection{Failure Case Analysis}
 
-Per-subject accuracy variance is observed across the test set. Common failure modes include: (1) VLR probes where extreme downsampling destroys facial structure, (2) subjects with similar facial geometry leading to inter-subject confusion, (3) DSR introducing smoothing artifacts that obscure discriminative features. The low Rank-1 accuracy (2-4\%) indicates that even with super-resolution, identification from such degraded inputs remains extremely challenging. Future work should explore attention mechanisms to focus SR on identity-critical regions.
+Per-subject accuracy variance is observed across the test set. Common failure modes include: (1) VLR probes where extreme downsampling destroys facial structure, (2) subjects with similar facial geometry leading to inter-subject confusion, (3) DSR introducing smoothing artifacts that obscure discriminative features. The low Rank-1 accuracy indicates that even with super-resolution, identification from such degraded inputs remains extremely challenging.
+
 \section{Conclusion and Future Work}
 
-This paper presented a pipeline for very-low-resolution facial recognition combining identity-aware super-resolution with lightweight recognition networks. Our key contributions include: (1) resolution-adaptive DSR architectures (16-20 residual blocks, 120-132 channels) trained with multi-scale perceptual and identity-preserving losses to optimize for recognition rather than perceptual quality alone, (2) integration with EdgeFace-XXS (1.24M parameters) for efficient embedding extraction, and (3) comprehensive evaluation across three VLR resolutions (16×16, 24×24, 32×32) demonstrating the tradeoffs between input resolution, reconstruction quality, and recognition performance.
+This paper presented a pipeline for very-low-resolution facial recognition combining identity-aware super-resolution with lightweight recognition networks. Our key contributions include: (1) resolution-adaptive Hybrid DSR architectures trained with multi-scale perceptual and identity-preserving losses, (2) integration with EdgeFace-XXS for efficient embedding extraction, and (3) comprehensive evaluation across three VLR resolutions.
 
-Our experiments show that 32×32 VLR inputs achieve the best verification performance (ROC-AUC 0.938, EER 13.3\%) and identification performance (Rank-1 4.26\%), while smaller resolutions suffer severe degradation (16×16: ROC-AUC 0.811, Rank-1 2.65\%). Super-resolution quality metrics (PSNR, SSIM) improve with larger inputs but do not directly correlate with recognition accuracy, indicating the importance of identity-aware training objectives.
-
-\textbf{Limitations:} Rank-1 identification accuracy (2-4\%) remains far below practical deployment thresholds, indicating fundamental challenges in recognizing faces from such severely degraded inputs. {INSERT CPU INFERENCE PERFORMANCE IF MEASURED}. Our evaluation is limited to frontal-face datasets; performance on unconstrained surveillance footage with pose/illumination variation remains to be validated.
+\textbf{Limitations:} Rank-1 identification accuracy remains far below practical deployment thresholds for the lowest resolutions. Our evaluation is limited to frontal-face datasets.
 
 \textbf{Future Directions:}
-
 \begin{enumerate}[leftmargin=*]
-    \item \textbf{Attention Mechanisms:} Integrate spatial attention to focus DSR on identity-critical facial regions (eyes, nose, mouth) rather than uniform reconstruction across the face.
-    
-    \item \textbf{Multi-Stage Refinement:} Progressive SR with intermediate recognition losses at multiple resolutions (16→32→64→128) may provide richer supervision than single-stage upsampling.
-    
-    \item \textbf{Quantization and Pruning:} Apply INT8 quantization and structured pruning to both DSR and EdgeFace for 4-8× speedup on CPU, enabling real-time edge deployment.
-    
-    \item \textbf{Domain Adaptation for Unconstrained Data:} Fine-tune on surveillance-style datasets with motion blur, compression artifacts, and diverse poses to improve generalization beyond controlled settings.
-    
-    \item \textbf{Adversarial Training:} Incorporate discriminator networks to prevent DSR from introducing recognizable artifacts that EdgeFace may exploit (dataset bias risk).
-    
-    \item \textbf{Few-Shot Gallery Enrollment:} Investigate techniques for robust gallery embedding estimation from limited reference images, crucial for practical deployment.
+    \item \textbf{Attention Mechanisms:} Integrate spatial attention to focus DSR on identity-critical facial regions.
+    \item \textbf{Multi-Stage Refinement:} Progressive SR with intermediate recognition losses.
+    \item \textbf{Quantization and Pruning:} Apply INT8 quantization for edge deployment.
+    \item \textbf{Domain Adaptation:} Fine-tune on surveillance-style datasets.
 \end{enumerate}
-
-In conclusion, our work demonstrates that identity-aware super-resolution with cycle training is a promising approach for VLR facial recognition. By explicitly optimizing SR for recognition performance rather than perceptual quality, and enabling co-adaptation between pipeline stages, we achieve substantial accuracy improvements while maintaining computational efficiency suitable for edge deployment. Future work addressing the limitations outlined above may push VLR-FR toward practical deployment thresholds.
 
 \section*{Acknowledgments}
 
-We thank the CMU Multi-PIE team for providing the facial recognition dataset, and the EdgeFace authors for releasing pretrained model weights. This work was supported by [institution/grant information to be added].
+We thank the CMU Multi-PIE team for providing the facial recognition dataset, and the EdgeFace authors for releasing pretrained model weights.
 
 \begin{thebibliography}{99}
 
@@ -358,7 +258,5 @@ We thank the CMU Multi-PIE team for providing the facial recognition dataset, an
 {INSERT DATASET CITATION IF NEEDED}
 
 \end{thebibliography}
-
-
 
 \end{document}

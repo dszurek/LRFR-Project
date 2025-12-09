@@ -483,6 +483,12 @@ def train_epoch(
     model.train()
     arcface.train()
 
+    # Freeze Batch Normalization statistics (keep pre-trained robust stats)
+    # This prevents the model from overfitting to the small fine-tuning dataset statistics
+    for module in model.modules():
+        if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            module.eval()
+
     total_loss = 0.0
     total_cls_loss = 0.0
     total_cont_loss = 0.0
@@ -842,82 +848,125 @@ def main(args: argparse.Namespace) -> None:
         weight_decay=config.weight_decay
     )
 
+    # Resume logic
+    start_stage = 1
+    start_epoch = 1
+    
+    if args.resume and save_path.exists():
+        print(f"\n[RESUME] Loading checkpoint from {save_path}")
+        checkpoint = torch.load(save_path, map_location=device, weights_only=False)
+        
+        # Restore model states
+        backbone.load_state_dict(checkpoint["backbone_state_dict"])
+        arcface.load_state_dict(checkpoint["arcface_state_dict"])
+        
+        # Restore training state
+        start_stage = checkpoint["stage"]
+        start_epoch = checkpoint["epoch"] + 1  # Start from next epoch
+        best_val_similarity = checkpoint.get("val_similarity", 0.0)
+        
+        # If we finished a stage, move to next stage
+        if start_stage == 1 and start_epoch > config.stage1_epochs:
+            start_stage = 2
+            start_epoch = 1
+            print(f"[RESUME] Stage 1 completed in checkpoint. Moving to Stage 2.")
+        elif start_stage == 2 and start_epoch > config.stage2_epochs:
+            print(f"[RESUME] Training already completed! (Stage 2 finished)")
+            return
+
+        print(f"[RESUME] Resuming from Stage {start_stage}, Epoch {start_epoch}")
+        
+        # Load optimizer if we are in the same stage
+        if start_stage == 1:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            # Move optimizer state to device
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+    
     # ========================================================================
     # STAGE 1: Freeze backbone, train ArcFace head
     # ========================================================================
-    print("\n" + "=" * 60)
-    print("STAGE 1: Training ArcFace head (backbone frozen)")
-    print("=" * 60)
+    if start_stage == 1:
+        print("\n" + "=" * 60)
+        print("STAGE 1: Training ArcFace head (backbone frozen)")
+        print("=" * 60)
+    
+        for param in backbone.parameters():
+            param.requires_grad = False
+    
+        print(f"[Info] With {len(train_subject_ids)} classes, accuracy will start low and improve gradually")
+        print(f"[Info] PRIMARY METRIC: Embedding similarity (should stay >0.95)")
+    
+        if not args.resume:
+            best_val_similarity = 0.0
+    
+        for epoch in range(start_epoch, config.stage1_epochs + 1):
+            # Stage 1: No contrastive learning (just train classification head)
+            train_loss, train_acc, train_top5 = train_epoch(
+                backbone,
+                arcface,
+                train_loader,
+                optimizer,
+                scaler,
+                device,
+                config.label_smoothing,
+                config.temperature,
+                use_contrastive=False,  # Disable contrastive in Stage 1
+            )
 
-    for param in backbone.parameters():
-        param.requires_grad = False
+            # Check for NaN in training
+            if torch.isnan(torch.tensor(train_loss)):
+                print(f"\n❌ CRITICAL: Training loss is NaN at epoch {epoch}")
+                print(f"   This usually means gradient explosion or numerical instability")
+                print(f"   Training cannot continue - please check:")
+                print(f"   1. Learning rate might be too high")
+                print(f"   2. Missing model weights causing instability")
+                print(f"   3. Dataset might have corrupted images")
+                break
 
-    print(f"[Info] With {len(train_subject_ids)} classes, accuracy will start low and improve gradually")
-    print(f"[Info] PRIMARY METRIC: Embedding similarity (should stay >0.95)")
+            val_loss, val_acc, val_top5, val_similarity = validate(
+                backbone, arcface, val_loader, device, train_subject_ids
+            )
 
-    best_val_similarity = 0.0
+            print(
+                f"Epoch {epoch:02d}/{config.stage1_epochs} | "
+                f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} Top5: {train_top5:.4f} | "
+                f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} Top5: {val_top5:.4f} Sim: {val_similarity:.4f}"
+            )
+            
+            # Add context for users with many classes
+            if len(train_subject_ids) > 100 and epoch == 1:
+                print(f"  [Note] With {len(train_subject_ids)} classes, accuracy starts low.")
+                print(f"  [Note] Watch for: (1) Similarity >0.95 ✓  (2) Accuracy improving ✓  (3) Loss decreasing ✓")
 
-    for epoch in range(1, config.stage1_epochs + 1):
-        # Stage 1: No contrastive learning (just train classification head)
-        train_loss, train_acc, train_top5 = train_epoch(
-            backbone,
-            arcface,
-            train_loader,
-            optimizer,
-            scaler,
-            device,
-            config.label_smoothing,
-            config.temperature,
-            use_contrastive=False,  # Disable contrastive in Stage 1
-        )
+            if val_similarity > best_val_similarity:
+                best_val_similarity = val_similarity
+                print(f"  [BEST] New best validation similarity: {val_similarity:.4f}")
 
-        # Check for NaN in training
-        if torch.isnan(torch.tensor(train_loss)):
-            print(f"\n❌ CRITICAL: Training loss is NaN at epoch {epoch}")
-            print(f"   This usually means gradient explosion or numerical instability")
-            print(f"   Training cannot continue - please check:")
-            print(f"   1. Learning rate might be too high")
-            print(f"   2. Missing model weights causing instability")
-            print(f"   3. Dataset might have corrupted images")
-            break
-
-        val_loss, val_acc, val_top5, val_similarity = validate(
-            backbone, arcface, val_loader, device, train_subject_ids
-        )
-
-        print(
-            f"Epoch {epoch:02d}/{config.stage1_epochs} | "
-            f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} Top5: {train_top5:.4f} | "
-            f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} Top5: {val_top5:.4f} Sim: {val_similarity:.4f}"
-        )
-        
-        # Add context for users with many classes
-        if len(train_subject_ids) > 100 and epoch == 1:
-            print(f"  [Note] With {len(train_subject_ids)} classes, accuracy starts low.")
-            print(f"  [Note] Watch for: (1) Similarity >0.95 ✓  (2) Accuracy improving ✓  (3) Loss decreasing ✓")
-
-        if val_similarity > best_val_similarity:
-            best_val_similarity = val_similarity
-            print(f"  [BEST] New best validation similarity: {val_similarity:.4f}")
-
-            # Save checkpoint even in Stage 1
-            checkpoint = {
-                "stage": 1,
-                "epoch": epoch,
-                "backbone_state_dict": backbone.state_dict(),
-                "arcface_state_dict": arcface.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_similarity": val_similarity,
-                "val_accuracy": val_acc,
-                "config": config,
-                "subject_to_id": train_dataset.subject_to_id,
-            }
-            torch.save(checkpoint, save_path)
-            print(f"  [SAVED] Saved Stage 1 checkpoint to {save_path}")
+                # Save checkpoint even in Stage 1
+                checkpoint = {
+                    "stage": 1,
+                    "epoch": epoch,
+                    "backbone_state_dict": backbone.state_dict(),
+                    "arcface_state_dict": arcface.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_similarity": val_similarity,
+                    "val_accuracy": val_acc,
+                    "config": config,
+                    "subject_to_id": train_dataset.subject_to_id,
+                }
+                torch.save(checkpoint, save_path)
+                print(f"  [SAVED] Saved Stage 1 checkpoint to {save_path}")
 
     # ========================================================================
     # STAGE 2: Unfreeze backbone, fine-tune end-to-end
     # ========================================================================
+    # If we just finished stage 1, reset start_epoch for stage 2
+    if start_stage == 1:
+        start_epoch = 1
+        
     print("\n" + "=" * 60)
     print("STAGE 2: Fine-tuning entire model (backbone unfrozen)")
     print("=" * 60)
@@ -945,7 +994,21 @@ def main(args: argparse.Namespace) -> None:
     # Track metrics for relative improvement
     first_epoch_acc = None
 
-    for epoch in range(1, config.stage2_epochs + 1):
+    # Load optimizer for Stage 2 if resuming in Stage 2 AND checkpoint was also Stage 2
+    if args.resume and start_stage == 2 and checkpoint["stage"] == 2:
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            # Move optimizer state to device
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+            print(f"[RESUME] Loaded Stage 2 optimizer state")
+        except Exception as e:
+            print(f"[RESUME] WARNING: Failed to load Stage 2 optimizer state: {e}")
+            print(f"[RESUME] Continuing with fresh optimizer for Stage 2")
+
+    for epoch in range(start_epoch, config.stage2_epochs + 1):
         # Stage 2: Enable contrastive learning (align DSR and HR embeddings)
         train_loss, train_acc, train_top5 = train_epoch(
             backbone,
@@ -1102,6 +1165,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Override number of stage 1 epochs (default: varies by resolution)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the last checkpoint if it exists",
     )
     return parser.parse_args()
 
